@@ -25,12 +25,10 @@ print_usage() {
     echo "  -t  TTL of records, in seconds"
     echo "  -4  Only update A record with external IPv4 address"
     echo "  -6  Only update A record with external IPv6 address"
-    echo ""
-    echo "NOTE: A/AAAA records must already exist in Cloudflare for FQDN"
 }
 
 QUIET=0
-TTL=43200
+TTL=3600
 DO_IPV4=0
 DO_IPV6=0
 
@@ -75,27 +73,36 @@ if [[ "$DO_IPV4" -ne 0 ]]; then
 
     # Get the Cloudflare A record
     CF_A_RECORD=$(curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=A&name=$RECORD" \
-    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-    -H "Content-Type: application/json")
+        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        -H "Content-Type: application/json")
 
     CF_A_RECORD_IP=$(echo "$CF_A_RECORD" | jq -r '{"result"}[] | .[0] | .content')
 
-    if [[ "$IPV4" == "$CF_A_RECORD_IP" ]]; then
+    if [[ "$CF_A_RECORD_IP" == "null" ]]; then
+        curl -fsS -o /dev/null -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"type":"A","name":"'"$RECORD"'","content":"'"$IPV4"'","ttl":"'"$TTL"'","proxied":false}'
+
+        #if [[ "$QUIET" -eq 0 ]]; then
+            echo -e "\033[1;35mNew: Created new Cloudflare A record for $RECORD: $IPV4\033[0m"
+        #fi
+    elif [[ "$IPV4" == "$CF_A_RECORD_IP" ]]; then
         if [[ "$QUIET" -eq 0 ]]; then
-            echo -e "\033[1;33mNo Change: Cloudflare A record is $CF_A_RECORD_IP\033[0m"
+            echo -e "\033[1;33mNo Change: Cloudflare A record for $RECORD is $CF_A_RECORD_IP\033[0m"
         fi
     else
         CF_A_RECORD_ID=$(echo "$CF_A_RECORD" | jq -r '{"result"}[] | .[0] | .id')
 
         # Update the Cloudflare A record
         curl -fsS -o /dev/null -X PUT "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$CF_A_RECORD_ID" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"type\":\"A\",\"name\":\"$RECORD\",\"content\":\"$IPV4\",\"ttl\":\"$TTL\",\"proxied\":false}"
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"type":"A","name":"'"$RECORD"'","content":"'"$IPV4"'","ttl":"'"$TTL"'","proxied":false}'
 
-        if [[ "$QUIET" -eq 0 ]]; then
-            echo -e "\033[1;35mUpdated: Cloudflare A record updated from $CF_A_RECORD_IP to $IPV4\033[0m"
-        fi
+        #if [[ "$QUIET" -eq 0 ]]; then
+            echo -e "\033[1;35mUpdated: Cloudflare A record for $RECORD updated from $CF_A_RECORD_IP to $IPV4\033[0m"
+        #fi
     fi
 
     if [[ -n "$A_HC" ]]; then
@@ -114,27 +121,36 @@ if [[ "$DO_IPV6" -ne 0 ]]; then
 
     # Get the Cloudflare A record
     CF_AAAA_RECORD=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=AAAA&name=$RECORD" \
-    -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-    -H "Content-Type: application/json")
+        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        -H "Content-Type: application/json")
 
     CF_AAAA_RECORD_IP=$(echo "$CF_AAAA_RECORD" | jq -r '{"result"}[] | .[0] | .content')
 
-    if [[ "$IPV6" == "$CF_AAAA_RECORD_IP" ]]; then
+    if [[ "$CF_AAAA_RECORD_IP" == "null" ]]; then
+        curl -fsS -o /dev/null -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"type":"AAAA","name":"'"$RECORD"'","content":"'"$IPV6"'","ttl":"'"$TTL"'","proxied":false}'
+
+        #if [[ "$QUIET" -eq 0 ]]; then
+            echo -e "\033[1;35mNew: Created new Cloudflare AAAA record for $RECORD: $IPV6\033[0m"
+        #fi
+    elif [[ "$IPV6" == "$CF_AAAA_RECORD_IP" ]]; then
         if [[ "$QUIET" -eq 0 ]]; then
-            echo -e "\033[1;33mNo Change: Cloudflare AAAA record is $CF_AAAA_RECORD_IP\033[0m"
+            echo -e "\033[1;33mNo Change: Cloudflare AAAA record for $RECORD is $CF_AAAA_RECORD_IP\033[0m"
         fi
     else
         CF_AAAA_RECORD_ID=$(echo "$CF_AAAA_RECORD" | jq -r '{"result"}[] | .[0] | .id')
 
         # Update Cloudflare AAAA the record
         curl -fsS -o /dev/null -X PUT "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$CF_AAAA_RECORD_ID" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-        -H "Content-Type: application/json" \
-        --data "{\"type\":\"AAAA\",\"name\":\"$RECORD\",\"content\":\"$IPV6\",\"ttl\":\"$TTL\",\"proxied\":false}"
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data '{"type":"AAAA","name":"'"$RECORD"'","content":"'"$IPV6"'","ttl":"'"$TTL"'","proxied":false}'
 
-        if [[ "$QUIET" -eq 0 ]]; then
-            echo -e "\033[1;35mUpdated: Cloudflare AAAA record updated from $CF_AAAA_RECORD_IP to $IPV6\033[0m"
-        fi
+        #if [[ "$QUIET" -eq 0 ]]; then
+            echo -e "\033[1;35mUpdated: Cloudflare AAAA record for $RECORD updated from $CF_AAAA_RECORD_IP to $IPV6\033[0m"
+        #fi
     fi
 
     if [[ -n "$AAAA_HC" ]]; then
