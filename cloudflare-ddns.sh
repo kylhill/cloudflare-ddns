@@ -65,7 +65,7 @@ fi
 
 if [[ "$DO_IPV4" -ne 0 ]]; then
     # Get the current external IPv4 address
-    IPV4=$(curl -fsS -X GET -4 https://ifconfig.co)
+    IPV4=$(curl -fsS -4 https://api.cloudflare.com/cdn-cgi/trace | awk -F= '/ip/ { print $2 }')
 
     if [[ "$QUIET" -eq 0 ]]; then
         echo "Current IPv4 is $IPV4"
@@ -113,7 +113,7 @@ fi
 
 if [[ "$DO_IPV6" -ne 0 ]]; then
     # Get the current external IPv6 address
-    IPV6=$(curl -fsS -X GET -6 https://ifconfig.co)
+    IPV6=$(curl -fsS -6 https://api.cloudflare.com/cdn-cgi/trace | awk -F= '/ip/ { print $2 }')
 
     if [[ "$QUIET" -eq 0 ]]; then
         echo "Current IPv6 is $IPV6"
