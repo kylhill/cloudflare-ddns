@@ -100,9 +100,8 @@ if [[ "$DO_IPV4" -ne 0 ]]; then
             -H "Content-Type: application/json" \
             --data '{"type":"A","name":"'"$RECORD"'","content":"'"$IPV4"'","ttl":"'"$TTL"'","proxied":false}'
 
-        #if [[ "$QUIET" -eq 0 ]]; then
-            echo -e "\033[1;35mUpdated: Cloudflare A record for $RECORD updated from $CF_A_RECORD_IP to $IPV4\033[0m"
-        #fi
+        echo -e "\033[1;35mUpdated: Cloudflare A record for $RECORD updated from $CF_A_RECORD_IP to $IPV4\033[0m"
+        echo -e "Subject:Cloudflare DDNS for $RECORD Updated\n\nCloudflare DDNS A record for $RECORD updated from $CF_A_RECORD_IP to $IPV4" | sendmail root
     fi
 
     if [[ -n "$A_HC" ]]; then
@@ -148,9 +147,8 @@ if [[ "$DO_IPV6" -ne 0 ]]; then
             -H "Content-Type: application/json" \
             --data '{"type":"AAAA","name":"'"$RECORD"'","content":"'"$IPV6"'","ttl":"'"$TTL"'","proxied":false}'
 
-        #if [[ "$QUIET" -eq 0 ]]; then
-            echo -e "\033[1;35mUpdated: Cloudflare AAAA record for $RECORD updated from $CF_AAAA_RECORD_IP to $IPV6\033[0m"
-        #fi
+        echo -e "\033[1;35mUpdated: Cloudflare AAAA record for $RECORD updated from $CF_AAAA_RECORD_IP to $IPV6\033[0m"
+        echo -e "Subject:Cloudflare DDNS for $RECORD Updated\n\nCloudflare DDNS AAAA record for $RECORD updated from $CF_AAAA_RECORD_IP to $IPV6" | sendmail root
     fi
 
     if [[ -n "$AAAA_HC" ]]; then
