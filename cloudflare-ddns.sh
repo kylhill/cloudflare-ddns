@@ -44,7 +44,7 @@ qprint() {
 
 get_ip() {
     if [[ "$1" -eq "-4" || "$1" -eq "-6" ]]; then
-        curl -fsS "$1" https://api.cloudflare.com/cdn-cgi/trace | awk -F= '/ip/ { print $2 }'
+        curl -fsS  -m 10 --retry 5 "$1" https://api.cloudflare.com/cdn-cgi/trace | awk -F= '/ip/ { print $2 }'
     else
         echo "get_ip: Must specify either -4 or -6 as an argument"
         exit 1
@@ -52,7 +52,7 @@ get_ip() {
 }
 
 get_record() {
-    curl -fsS -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=$1&name=$RECORD&page=1&per_page=1" \
+    curl -fsS  -m 10 --retry 5 -X GET "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records?type=$1&name=$RECORD&page=1&per_page=1" \
         -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
         -H "Content-Type: application/json"
 }
