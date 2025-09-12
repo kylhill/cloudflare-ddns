@@ -157,7 +157,7 @@ if ! command -v jq &> /dev/null; then
 fi
 
 if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ZONE_ID" ]]; then
-    echo "Define CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID in $0"
+    echo "Error: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID must be defined."
     exit 1
 fi
 
