@@ -107,7 +107,7 @@ create_https_record() {
         curl -fsS -o /dev/null -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --data '{"type":"HTTPS","name":"'"$RECORD"'","data":{"priority":"1","target":".","value":"alpn=\"h2\" ipv4hint=\"'"$1"'\" ipv6hint=\"'"$2"'\""},"ttl":"'"$TTL"'"}'
+            --data '{"type":"HTTPS","name":"'"$RECORD"'","data":{"priority":"1","target":".","value":"alpn=\"h3,h2\" ipv4hint=\"'"$1"'\" ipv6hint=\"'"$2"'\""},"ttl":"'"$TTL"'"}'
     fi
 }
 
@@ -119,7 +119,7 @@ update_https_record() {
         curl -fsS -o /dev/null -X PATCH "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/dns_records/$1" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             -H "Content-Type: application/json" \
-            --data '{"type":"HTTPS","name":"'"$RECORD"'","data":{"priority":"1","target":".","value":"alpn=\"h2\" ipv4hint=\"'"$2"'\" ipv6hint=\"'"$3"'\""},"ttl":"'"$TTL"'"}'
+            --data '{"type":"HTTPS","name":"'"$RECORD"'","data":{"priority":"1","target":".","value":"alpn=\"h3,h2\" ipv4hint=\"'"$2"'\" ipv6hint=\"'"$3"'\""},"ttl":"'"$TTL"'"}'
     fi
 }
 
