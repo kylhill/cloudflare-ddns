@@ -20,7 +20,7 @@ DO_IPV4=false
 DO_IPV6=false
 CF_UPDATED=false
 
-CURL="curl -fsS -m 10 --retry 5"
+CURL_GET="curl -fsS -m 10 --retry 5"
 CF_API="https://api.cloudflare.com/client/v4"
 
 print_usage() {
