@@ -21,7 +21,7 @@ DO_IPV6=false
 CF_UPDATED=false
 
 CURL="curl -fsS -m 10 --retry 5"
-CF_API="https://api.cloudflare.com/client/v4
+CF_API="https://api.cloudflare.com/client/v4"
 
 print_usage() {
     echo ""
