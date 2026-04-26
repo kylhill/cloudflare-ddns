@@ -376,10 +376,6 @@ on_exit() {
             printf 'Content-Type: text/plain; charset=UTF-8\n'
             printf '\n'
             printf '%s\n' "${NOTIFY_LINES[@]}"
-            printf '\n'
-            printf 'Host:        %s\n' "$host"
-            printf 'Record:      %s\n' "$RECORD"
-            printf 'Exit status: %s\n' "$rc"
         } | sendmail root || true
     fi
     exit "$rc"
