@@ -30,12 +30,7 @@ A_ATTEMPTED=false
 AAAA_ATTEMPTED=false
 A_OK=false
 AAAA_OK=false
-SCRIPT_NAME="${0##*/}"
-USER_AGENT="cloudflare-ddns/2.2"
-
-# Ephemeral system-wide state (root-writable tmpfs).
-# Holds per-record locks; safe to lose across reboots.
-STATE_DIR="/run/cloudflare-ddns"
+USER_AGENT="cloudflare-ddns/2.3"
 
 CF_API="https://api.cloudflare.com/client/v4"
 
@@ -82,7 +77,7 @@ NOTIFY_LINES=()
 print_usage() {
     cat <<EOF
 
-Usage:  $SCRIPT_NAME [OPTIONS] FQDN
+Usage:  ${0##*/} [OPTIONS] FQDN
 
 Updates Cloudflare DNS A and AAAA records with external IPv4 and IPv6 addresses of the current machine
 
@@ -244,13 +239,16 @@ parse_https_record() {
     ' <<<"$1"
 }
 
+# Note: `|| true` on the mutate call so a non-2xx response (curl exits
+# non-zero under --fail-with-body) doesn't trip `set -e` before
+# check_success can surface the API error message.
 create_host_record() {
     local type="$1" ip="$2" proxied="$3" data body
     data=$(jq -nc \
         --arg type "$type" --arg name "$RECORD" --arg ip "$ip" \
         --argjson ttl "$TTL" --argjson proxied "$proxied" \
         '{type:$type, name:$name, content:$ip, ttl:$ttl, proxied:$proxied}')
-    body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data")
+    body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data") || true
     check_success "$body" "create $type record"
 }
 
@@ -260,7 +258,7 @@ update_host_record() {
         --arg type "$type" --arg name "$RECORD" --arg ip "$ip" \
         --argjson ttl "$TTL" --argjson proxied "$proxied" \
         '{type:$type, name:$name, content:$ip, ttl:$ttl, proxied:$proxied}')
-    body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data")
+    body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data") || true
     check_success "$body" "update $type record"
 }
 
@@ -287,14 +285,14 @@ https_record_data() {
 create_https_record() {
     local value="$1" data body
     data=$(https_record_data "$value")
-    body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data")
+    body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data") || true
     check_success "$body" "create HTTPS record"
 }
 
 update_https_record() {
     local id="$1" value="$2" data body
     data=$(https_record_data "$value")
-    body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data")
+    body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data") || true
     check_success "$body" "update HTTPS record"
 }
 
@@ -359,14 +357,17 @@ on_error() {
 
 # Exit trap: flush batched notification email so partial progress (e.g. a
 # successful A update before an AAAA failure) still gets reported.
+# `set +e` so a "false" condition (e.g. empty NOTIFY_LINES) inside the trap
+# doesn't override the script's real exit status under `set -e`.
 on_exit() {
     local rc=$?
-    if (( ${#NOTIFY_LINES[@]} > 0 )) && command -v sendmail >/dev/null; then
-        local subject="Cloudflare DDNS for $RECORD Updated"
-        (( rc != 0 )) && subject="Cloudflare DDNS for $RECORD Updated (with errors, rc=$rc)"
-        local hostname date_hdr
-        hostname=$(hostname -f 2>/dev/null || hostname)
+    set +e
+    if [[ ${#NOTIFY_LINES[@]} -gt 0 ]] && command -v sendmail >/dev/null; then
+        local host date_hdr subject
+        host=$(hostname -f 2>/dev/null || hostname)
         date_hdr=$(date -R)
+        subject="[$host] Cloudflare DDNS for $RECORD updated"
+        (( rc != 0 )) && subject="[$host] Cloudflare DDNS for $RECORD updated (with errors, rc=$rc)"
         {
             printf 'To: root\n'
             printf 'Date: %s\n' "$date_hdr"
@@ -375,8 +376,13 @@ on_exit() {
             printf 'Content-Type: text/plain; charset=UTF-8\n'
             printf '\n'
             printf '%s\n' "${NOTIFY_LINES[@]}"
+            printf '\n'
+            printf 'Host:        %s\n' "$host"
+            printf 'Record:      %s\n' "$RECORD"
+            printf 'Exit status: %s\n' "$rc"
         } | sendmail root || true
     fi
+    exit "$rc"
 }
 trap on_error ERR
 trap on_exit EXIT
@@ -422,15 +428,14 @@ if ! [[ "$TTL" =~ ^[0-9]+$ ]] || ! { [[ "$TTL" == "1" ]] || (( TTL >= 120 && TTL
     exit 1
 fi
 
-# ---- ephemeral state dir + single-instance lock (per record) ----
-# When invoked from systemd with `RuntimeDirectory=cloudflare-ddns`, the
-# RUNTIME_DIRECTORY env var points at the unit-managed dir; prefer it.
-if [[ -n "${RUNTIME_DIRECTORY:-}" ]]; then
-    STATE_DIR="${RUNTIME_DIRECTORY%%:*}"
-else
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR" 2>/dev/null || true
+# ---- single-instance lock (per record) ----
+# State dir is managed by systemd via `RuntimeDirectory=cloudflare-ddns`,
+# which exports RUNTIME_DIRECTORY. The unit is the only supported caller.
+if [[ -z "${RUNTIME_DIRECTORY:-}" ]]; then
+    err "RUNTIME_DIRECTORY is not set; this script expects to be launched from systemd with RuntimeDirectory=cloudflare-ddns"
+    exit 1
 fi
+STATE_DIR="${RUNTIME_DIRECTORY%%:*}"
 # Sanitize record name so unusual input can't escape STATE_DIR
 RECORD_SAFE=${RECORD//[^A-Za-z0-9._-]/_}
 LOCK_FILE="$STATE_DIR/${RECORD_SAFE}.lock"
