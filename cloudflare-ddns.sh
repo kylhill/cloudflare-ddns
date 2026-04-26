@@ -227,13 +227,17 @@ parse_record() {
 # the API.
 parse_https_record() {
     jq -r '
+        # `?` swallows capture errors (no match) into an empty stream;
+        # `// ""` then supplies the empty-string default. Without the `?`
+        # an absent hint would abort jq entirely.
+        def cap($re): (capture($re).v)? // "";
         .result[0] // {} as $r |
         ($r.data.value // "") as $v |
         [
             ($r.id // ""),
-            ($v | capture("ipv4hint=\"(?<v>[^\"]+)\"") | .v // ""),
-            ($v | capture("ipv6hint=\"(?<v>[^\"]+)\"") | .v // ""),
-            ($v | capture("alpn=\"(?<v>[^\"]+)\"") | .v // ""),
+            ($v | cap("ipv4hint=\"(?<v>[^\"]+)\"")),
+            ($v | cap("ipv6hint=\"(?<v>[^\"]+)\"")),
+            ($v | cap("alpn=\"(?<v>[^\"]+)\"")),
             (($r.proxied // false) | tostring),
             (($r.ttl // 0) | tostring)
         ] | .[]
