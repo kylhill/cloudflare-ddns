@@ -272,23 +272,24 @@ https_value() {
 }
 
 https_record_data() {
-    local value="$1" proxied="${2:-false}"
-    jq -nc --arg name "$RECORD" --arg value "$value" \
-        --argjson ttl "$TTL" --argjson proxied "$proxied" \
-        '{type:"HTTPS", name:$name, ttl:$ttl, proxied:$proxied,
+    local value="$1"
+    # NOTE: HTTPS records do not accept a `proxied` field; sending it makes
+    # the Cloudflare API reject the create/update request.
+    jq -nc --arg name "$RECORD" --arg value "$value" --argjson ttl "$TTL" \
+        '{type:"HTTPS", name:$name, ttl:$ttl,
           data:{priority:1, target:".", value:$value}}'
 }
 
 create_https_record() {
-    local value="$1" proxied="${2:-false}" data body
-    data=$(https_record_data "$value" "$proxied")
+    local value="$1" data body
+    data=$(https_record_data "$value")
     body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data")
     check_success "$body" "create HTTPS record"
 }
 
 update_https_record() {
-    local id="$1" value="$2" proxied="${3:-false}" data body
-    data=$(https_record_data "$value" "$proxied")
+    local id="$1" value="$2" data body
+    data=$(https_record_data "$value")
     body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data")
     check_success "$body" "update HTTPS record"
 }
@@ -364,7 +365,6 @@ on_exit() {
         date_hdr=$(date -R)
         {
             printf 'To: root\n'
-            printf 'From: cloudflare-ddns@%s\n' "$hostname"
             printf 'Date: %s\n' "$date_hdr"
             printf 'Subject: %s\n' "$subject"
             printf 'MIME-Version: 1.0\n'
@@ -492,15 +492,15 @@ if [[ "$DO_HTTPS" = true ]]; then
     new_value=$(https_value "$IPV4" "$IPV6" "$cf_alpn")
 
     if [[ -z "$cf_https_id" ]]; then
-        create_https_record "$new_value" false
+        create_https_record "$new_value"
         printf '%sCreated new HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
         NOTIFY_LINES+=("Created HTTPS record for $RECORD")
     elif [[ "$cf_ipv4hint" != "$IPV4" || "$cf_ipv6hint" != "$IPV6" ]]; then
-        update_https_record "$cf_https_id" "$new_value" "$cf_proxied"
+        update_https_record "$cf_https_id" "$new_value"
         printf '%sUpdated HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
         NOTIFY_LINES+=("Updated HTTPS record for $RECORD (ipv4hint=$IPV4 ipv6hint=$IPV6)")
     elif [[ "$cf_https_ttl" != "$TTL" ]]; then
-        update_https_record "$cf_https_id" "$new_value" "$cf_proxied"
+        update_https_record "$cf_https_id" "$new_value"
         printf '%sUpdated TTL of HTTPS record for %s from %s to %s%s\n' \
             "$C_PURPLE" "$RECORD" "$cf_https_ttl" "$TTL" "$C_RESET"
         NOTIFY_LINES+=("Updated TTL of HTTPS record for $RECORD: $cf_https_ttl -> $TTL")
