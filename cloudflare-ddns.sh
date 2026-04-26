@@ -28,8 +28,10 @@ IPV4=""
 IPV6=""
 A_ATTEMPTED=false
 AAAA_ATTEMPTED=false
+A_OK=false
+AAAA_OK=false
 SCRIPT_NAME="${0##*/}"
-USER_AGENT="cloudflare-ddns/2.1"
+USER_AGENT="cloudflare-ddns/2.2"
 
 # Ephemeral system-wide state (root-writable tmpfs).
 # Holds per-record locks; safe to lose across reboots.
@@ -118,7 +120,8 @@ get_ip() {
 
     for url in \
         "https://api.cloudflare.com/cdn-cgi/trace" \
-        "https://icanhazip.com"
+        "https://icanhazip.com" \
+        "https://ifconfig.co"
     do
         if ! ip=$("${CURL_IP[@]}" "$family" "$url" 2>&1); then
             last_err="$ip"
@@ -145,8 +148,12 @@ check_success() {
     ok=$(jq -r '.success // false' <<<"$body" 2>/dev/null || echo false)
     if [[ "$ok" != "true" ]]; then
         err "Cloudflare API error during $context:"
-        jq -r '.errors[]? | "  [\(.code)] \(.message)"' <<<"$body" >&2 2>/dev/null \
-            || printf '%s\n' "$body" >&2
+        if ! jq -e '.errors // empty' <<<"$body" >/dev/null 2>&1; then
+            # Non-JSON (e.g. HTML 502 page from a proxy); truncate to keep logs readable
+            printf '%s\n' "$body" | head -n 20 >&2
+        else
+            jq -r '.errors[]? | "  [\(.code)] \(.message)"' <<<"$body" >&2
+        fi
         return 1
     fi
 }
@@ -171,9 +178,9 @@ cf_api_mutate() {
     local method="$1" path="$2" data="$3"
     local -a curl_cmd
     case "$method" in
-        POST)  curl_cmd=("${CURL_POST[@]}") ;;
-        PATCH|PUT) curl_cmd=("${CURL_PATCH[@]}") ;;
-        *)     curl_cmd=("${CURL_PATCH[@]}") ;;
+        POST)        curl_cmd=("${CURL_POST[@]}") ;;
+        PATCH|PUT)   curl_cmd=("${CURL_PATCH[@]}") ;;
+        *)           err "cf_api_mutate: unsupported method '$method'"; return 2 ;;
     esac
     "${curl_cmd[@]}" \
         -X "$method" \
@@ -214,9 +221,10 @@ parse_record() {
     ' <<<"$1"
 }
 
-# Parse id + ipv4hint + ipv6hint + ttl from an HTTPS result[0]. Outputs four lines.
-# Hints are extracted from the SvcParams string so comparison is robust to
-# whitespace / ordering / quoting differences from the API.
+# Parse id + ipv4hint + ipv6hint + alpn + proxied + ttl from an HTTPS result[0].
+# Outputs six lines. Hints/alpn are extracted from the SvcParams string so
+# comparison is robust to whitespace / ordering / quoting differences from
+# the API.
 parse_https_record() {
     jq -r '
         .result[0] // {} as $r |
@@ -225,6 +233,8 @@ parse_https_record() {
             ($r.id // ""),
             ($v | capture("ipv4hint=\"(?<v>[^\"]+)\"") | .v // ""),
             ($v | capture("ipv6hint=\"(?<v>[^\"]+)\"") | .v // ""),
+            ($v | capture("alpn=\"(?<v>[^\"]+)\"") | .v // ""),
+            (($r.proxied // false) | tostring),
             (($r.ttl // 0) | tostring)
         ] | .[]
     ' <<<"$1"
@@ -250,31 +260,35 @@ update_host_record() {
     check_success "$body" "update $type record"
 }
 
-# Build SvcParams string for an HTTPS record (only include hints we have)
+# Build SvcParams string for an HTTPS record (only include hints we have).
+# Preserves alpn from the existing record when present; falls back to a
+# sensible default for newly-created records.
 https_value() {
-    local ipv4="$1" ipv6="$2" value
-    value='alpn="h3,h2"'
+    local ipv4="$1" ipv6="$2" alpn="${3:-h3,h2}" value
+    value="alpn=\"$alpn\""
     [[ -n "$ipv4" ]] && value+=" ipv4hint=\"$ipv4\""
     [[ -n "$ipv6" ]] && value+=" ipv6hint=\"$ipv6\""
     printf '%s' "$value"
 }
 
 https_record_data() {
-    local value="$1"
-    jq -nc --arg name "$RECORD" --arg value "$value" --argjson ttl "$TTL" \
-        '{type:"HTTPS", name:$name, ttl:$ttl, data:{priority:1, target:".", value:$value}}'
+    local value="$1" proxied="${2:-false}"
+    jq -nc --arg name "$RECORD" --arg value "$value" \
+        --argjson ttl "$TTL" --argjson proxied "$proxied" \
+        '{type:"HTTPS", name:$name, ttl:$ttl, proxied:$proxied,
+          data:{priority:1, target:".", value:$value}}'
 }
 
 create_https_record() {
-    local value="$1" data body
-    data=$(https_record_data "$value")
+    local value="$1" proxied="${2:-false}" data body
+    data=$(https_record_data "$value" "$proxied")
     body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data")
     check_success "$body" "create HTTPS record"
 }
 
 update_https_record() {
-    local id="$1" value="$2" data body
-    data=$(https_record_data "$value")
+    local id="$1" value="$2" proxied="${3:-false}" data body
+    data=$(https_record_data "$value" "$proxied")
     body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data")
     check_success "$body" "update HTTPS record"
 }
@@ -324,14 +338,15 @@ sync_host_record() {
     ping_hc "$hc_url"
 }
 
-# Failure trap: ping /fail only for families we actually attempted, so a
-# -4-only run that fails doesn't falsely mark the AAAA healthcheck failed.
+# Failure trap: ping /fail only for families we attempted but did NOT mark
+# successful, so a partial run (A succeeded, AAAA failed) doesn't falsely
+# mark the A healthcheck as failed.
 on_error() {
     local rc=$?
-    if [[ "$A_ATTEMPTED" = true && -n "$A_HC" ]]; then
+    if [[ "$A_ATTEMPTED" = true && "$A_OK" = false && -n "$A_HC" ]]; then
         "${CURL_GET[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
     fi
-    if [[ "$AAAA_ATTEMPTED" = true && -n "$AAAA_HC" ]]; then
+    if [[ "$AAAA_ATTEMPTED" = true && "$AAAA_OK" = false && -n "$AAAA_HC" ]]; then
         "${CURL_GET[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
     fi
     exit "$rc"
@@ -344,8 +359,17 @@ on_exit() {
     if (( ${#NOTIFY_LINES[@]} > 0 )) && command -v sendmail >/dev/null; then
         local subject="Cloudflare DDNS for $RECORD Updated"
         (( rc != 0 )) && subject="Cloudflare DDNS for $RECORD Updated (with errors, rc=$rc)"
+        local hostname date_hdr
+        hostname=$(hostname -f 2>/dev/null || hostname)
+        date_hdr=$(date -R)
         {
-            printf 'Subject: %s\n\n' "$subject"
+            printf 'To: root\n'
+            printf 'From: cloudflare-ddns@%s\n' "$hostname"
+            printf 'Date: %s\n' "$date_hdr"
+            printf 'Subject: %s\n' "$subject"
+            printf 'MIME-Version: 1.0\n'
+            printf 'Content-Type: text/plain; charset=UTF-8\n'
+            printf '\n'
             printf '%s\n' "${NOTIFY_LINES[@]}"
         } | sendmail root || true
     fi
@@ -395,9 +419,17 @@ if ! [[ "$TTL" =~ ^[0-9]+$ ]] || ! { [[ "$TTL" == "1" ]] || (( TTL >= 120 && TTL
 fi
 
 # ---- ephemeral state dir + single-instance lock (per record) ----
-mkdir -p "$STATE_DIR"
-chmod 700 "$STATE_DIR" 2>/dev/null || true
-LOCK_FILE="$STATE_DIR/${RECORD}.lock"
+# When invoked from systemd with `RuntimeDirectory=cloudflare-ddns`, the
+# RUNTIME_DIRECTORY env var points at the unit-managed dir; prefer it.
+if [[ -n "${RUNTIME_DIRECTORY:-}" ]]; then
+    STATE_DIR="${RUNTIME_DIRECTORY%%:*}"
+else
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+fi
+# Sanitize record name so unusual input can't escape STATE_DIR
+RECORD_SAFE=${RECORD//[^A-Za-z0-9._-]/_}
+LOCK_FILE="$STATE_DIR/${RECORD_SAFE}.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     err "Another instance is already running for $RECORD"
@@ -417,6 +449,7 @@ if [[ "$DO_IPV4" = true ]]; then
     fi
     qprint "Current IPv4 is $IPV4"
     sync_host_record A "$IPV4" "$A_HC"
+    A_OK=true
 fi
 
 # ---- AAAA record ----
@@ -429,6 +462,7 @@ if [[ "$DO_IPV6" = true ]]; then
     fi
     qprint "Current IPv6 is $IPV6"
     sync_host_record AAAA "$IPV6" "$AAAA_HC"
+    AAAA_OK=true
 fi
 
 # ---- HTTPS record ----
@@ -442,33 +476,31 @@ if [[ "$DO_HTTPS" = true ]]; then
         exit 1
     fi
 
-    { read -r cf_https_id; read -r cf_ipv4hint; read -r cf_ipv6hint; read -r cf_https_ttl; } < <(parse_https_record "$https_resp")
+    { read -r cf_https_id
+      read -r cf_ipv4hint
+      read -r cf_ipv6hint
+      read -r cf_alpn
+      read -r cf_proxied
+      read -r cf_https_ttl
+    } < <(parse_https_record "$https_resp")
 
     # If a family wasn't refreshed in this run (e.g. -4-only), preserve the
     # existing hint from Cloudflare so we don't silently drop it.
-    if [[ "$DO_IPV4" = true && -z "$IPV4" ]]; then
-        IPV4=$(get_ip -4)
-        valid_ipv4 "$IPV4" || { err "Invalid IPv4 detected: $IPV4"; exit 1; }
-    elif [[ "$DO_IPV4" = false ]]; then
-        IPV4="$cf_ipv4hint"
-    fi
-    if [[ "$DO_IPV6" = true && -z "$IPV6" ]]; then
-        IPV6=$(get_ip -6)
-        valid_ipv6 "$IPV6" || { err "Invalid IPv6 detected: $IPV6"; exit 1; }
-    elif [[ "$DO_IPV6" = false ]]; then
-        IPV6="$cf_ipv6hint"
-    fi
+    [[ "$DO_IPV4" = false ]] && IPV4="$cf_ipv4hint"
+    [[ "$DO_IPV6" = false ]] && IPV6="$cf_ipv6hint"
+
+    new_value=$(https_value "$IPV4" "$IPV6" "$cf_alpn")
 
     if [[ -z "$cf_https_id" ]]; then
-        create_https_record "$(https_value "$IPV4" "$IPV6")"
+        create_https_record "$new_value" false
         printf '%sCreated new HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
         NOTIFY_LINES+=("Created HTTPS record for $RECORD")
     elif [[ "$cf_ipv4hint" != "$IPV4" || "$cf_ipv6hint" != "$IPV6" ]]; then
-        update_https_record "$cf_https_id" "$(https_value "$IPV4" "$IPV6")"
+        update_https_record "$cf_https_id" "$new_value" "$cf_proxied"
         printf '%sUpdated HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
         NOTIFY_LINES+=("Updated HTTPS record for $RECORD (ipv4hint=$IPV4 ipv6hint=$IPV6)")
     elif [[ "$cf_https_ttl" != "$TTL" ]]; then
-        update_https_record "$cf_https_id" "$(https_value "$IPV4" "$IPV6")"
+        update_https_record "$cf_https_id" "$new_value" "$cf_proxied"
         printf '%sUpdated TTL of HTTPS record for %s from %s to %s%s\n' \
             "$C_PURPLE" "$RECORD" "$cf_https_ttl" "$TTL" "$C_RESET"
         NOTIFY_LINES+=("Updated TTL of HTTPS record for $RECORD: $cf_https_ttl -> $TTL")
