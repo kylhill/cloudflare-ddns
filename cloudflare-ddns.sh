@@ -29,7 +29,6 @@ IPV4=""
 IPV6=""
 SCRIPT_NAME="${0##*/}"
 USER_AGENT="cloudflare-ddns/2.0"
-STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cloudflare-ddns"
 
 # Curl base options
 #   --fail-with-body : print body on HTTP error (>=4xx) before exit
@@ -322,10 +321,6 @@ if ! command -v jq &> /dev/null; then
     err "jq is not installed. Install it via 'apt install jq'."
     exit 1
 fi
-if ! command -v flock &> /dev/null; then
-    err "flock is not installed. Install it via 'apt install util-linux'."
-    exit 1
-fi
 
 if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ZONE_ID" ]]; then
     err "Error: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID must be defined."
@@ -334,15 +329,6 @@ fi
 
 if ! [[ "$TTL" =~ ^[0-9]+$ ]] || ! { [[ "$TTL" == "1" ]] || (( TTL >= 120 && TTL <= 86400 )); }; then
     err "TTL must be 1 (auto) or an integer between 120 and 86400"
-    exit 1
-fi
-
-# ---- single-instance lock (per record) ----
-mkdir -p "$STATE_DIR"
-LOCK_FILE="$STATE_DIR/${RECORD}.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-    err "Another instance is already running for $RECORD"
     exit 1
 fi
 
