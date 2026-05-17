@@ -460,7 +460,16 @@ fi
 # ---- AAAA record ----
 if [[ "$DO_IPV6" = true ]]; then
     AAAA_ATTEMPTED=true
-    IPV6=$(get_ip -6)
+    if [[ -n "${CLOUDFLARE_DDNS_AAAA_IFACE:-}" ]]; then
+        IPV6=$(ip -6 addr show dev "$CLOUDFLARE_DDNS_AAAA_IFACE" scope global \
+            | awk '/inet6/ { split($2,a,"/"); print a[1]; exit }')
+        if [[ -z "$IPV6" ]]; then
+            err "No global IPv6 address found on interface $CLOUDFLARE_DDNS_AAAA_IFACE"
+            IPV6=$(get_ip -6)
+        fi
+    else
+        IPV6=$(get_ip -6)
+    fi
     if ! valid_ipv6 "$IPV6"; then
         err "Invalid IPv6 detected: $IPV6"
         exit 1
