@@ -1,4 +1,4 @@
-# Cloudflare DDNS — Copilot Instructions
+# Cloudflare DDNS Agent Instructions
 
 ## Overview
 
