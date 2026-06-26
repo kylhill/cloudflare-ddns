@@ -10,7 +10,7 @@ Options:
   -h  Print usage help
   -q  Enable quiet mode
   -s  Update HTTPS record with external IPv4 and IPv6 addresses
-  -t  TTL of records, in seconds (1 = auto, otherwise 120-86400)
+  -t  TTL of records, in seconds (1 = auto, otherwise 60-86400)
   -4  Only update A record with external IPv4 address
   -6  Only update AAAA record with external IPv6 address
 ```
@@ -26,5 +26,17 @@ Options:
 
 ## Dependencies
 
-- `bash`, `curl`, `jq`, `flock`
+- `bash`, `curl`, `jq`, `flock`, `awk`, `tr`
+- `ip` when `CLOUDFLARE_DDNS_AAAA_IFACE` is set
 - `sendmail` (optional; used to email a per-run change summary to `root`)
+
+## Validation
+
+```sh
+bash -n cloudflare-ddns.sh
+shellcheck cloudflare-ddns.sh
+tests/run.sh
+```
+
+The test harness mocks external commands and does not contact Cloudflare or IP
+lookup providers.

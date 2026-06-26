@@ -39,7 +39,7 @@ CF_API="https://api.cloudflare.com/client/v4"
 #   --connect-timeout: bound DNS/TCP/TLS handshake
 #   -m / --max-time  : bound total transfer
 CURL_BASE=(
-    curl -sS
+    curl -q -sS
     --fail-with-body
     -A "$USER_AGENT"
     --connect-timeout 5
@@ -47,15 +47,14 @@ CURL_BASE=(
 )
 # Read-only / idempotent requests can retry liberally
 CURL_GET=("${CURL_BASE[@]}" --retry 5 --retry-delay 2 --retry-max-time 30)
-# POSTs (record creation) are NOT idempotent: a transient 5xx on a request
-# that actually reached Cloudflare could create a duplicate on retry. Retry
-# only on connection-level errors (curl's default), and at most once.
-CURL_POST=("${CURL_BASE[@]}" --retry 1 --retry-delay 2)
+# POSTs (record creation) are NOT idempotent: a transient error on a
+# request that actually reached Cloudflare could create a duplicate on retry.
+CURL_POST=("${CURL_BASE[@]}")
 # PATCH (record update) is idempotent, so retry liberally on any error.
 CURL_PATCH=("${CURL_BASE[@]}" --retry 3 --retry-delay 2 --retry-max-time 20 --retry-all-errors)
 # IP detection: tight timeout, single retry; we already iterate fallbacks
 CURL_IP=(
-    curl -sS --fail-with-body -A "$USER_AGENT"
+    curl -q -sS --fail-with-body -A "$USER_AGENT"
     --connect-timeout 3 --max-time 5
     --retry 1 --retry-delay 1
 )
@@ -85,7 +84,7 @@ Options:
   -h  Print usage help
   -q  Enable quiet mode
   -s  Update HTTPS record with external IPv4 and IPv6 addresses
-  -t  TTL of records, in seconds (1 = auto, otherwise 120-86400)
+  -t  TTL of records, in seconds (1 = auto, otherwise 60-86400)
   -4  Only update A record with external IPv4 address
   -6  Only update AAAA record with external IPv6 address
 EOF
@@ -93,6 +92,36 @@ EOF
 
 err()    { printf '%s\n' "$*" >&2; }
 qprint() { [[ "$QUIET" -eq 0 ]] && printf '%s\n' "$1"; return 0; }
+
+require_cmd() {
+    local cmd
+    for cmd in "$@"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            err "$cmd is not installed or not in PATH."
+            return 1
+        fi
+    done
+}
+
+normalize_record() {
+    local record="${1%.}"
+    printf '%s' "${record,,}"
+}
+
+valid_record() {
+    local record="$1" label
+    [[ ${#record} -le 253 ]] || return 1
+    [[ "$record" == *.* ]] || return 1
+    [[ "$record" != .* && "$record" != *. ]] || return 1
+    [[ "$record" != *..* ]] || return 1
+    [[ "$record" =~ ^[a-z0-9.-]+$ ]] || return 1
+
+    IFS=. read -r -a labels <<<"$record"
+    for label in "${labels[@]}"; do
+        [[ -n "$label" && ${#label} -le 63 ]] || return 1
+        [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || return 1
+    done
+}
 
 valid_ipv4() {
     local ip="$1" octet
@@ -195,16 +224,27 @@ verify_token() {
     check_success "$body" "token verification"
 }
 
+get_records_checked() {
+    local type="$1" body
+    body=$(get_records "$type") || {
+        err "Cloudflare API request failed while listing $type records:"
+        [[ -n "$body" ]] && printf '%s\n' "$body" >&2
+        return 1
+    }
+    check_success "$body" "list $type records"
+    printf '%s' "$body"
+}
+
 # Get all records matching type + name (up to 100).
 get_records() {
     cf_api_get "/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
-        "type=$1" "name=$RECORD" "page=1" "per_page=100"
+        "type=$1" "name.exact=$RECORD" "page=1" "per_page=100"
 }
 
 # Refuse to proceed if more than one record matches; safer than silently
 # updating only the first.
 record_count() {
-    jq -r '.result | length' <<<"$1"
+    jq -r '.result_info.total_count // (.result | length)' <<<"$1"
 }
 
 # Parse id + content + proxied + ttl from result[0]. Outputs four lines.
@@ -216,8 +256,8 @@ parse_record() {
     ' <<<"$1"
 }
 
-# Parse id + ipv4hint + ipv6hint + alpn + proxied + ttl from an HTTPS result[0].
-# Outputs six lines. Hints/alpn are extracted from the SvcParams string so
+# Parse id + ipv4hint + ipv6hint + value + ttl from an HTTPS result[0].
+# Outputs five lines. Hints are extracted from the SvcParams string so
 # comparison is robust to whitespace / ordering / quoting differences from
 # the API.
 parse_https_record() {
@@ -232,8 +272,7 @@ parse_https_record() {
             ($r.id // ""),
             ($v | cap("ipv4hint=\"(?<v>[^\"]+)\"")),
             ($v | cap("ipv6hint=\"(?<v>[^\"]+)\"")),
-            ($v | cap("alpn=\"(?<v>[^\"]+)\"")),
-            (($r.proxied // false) | tostring),
+            $v,
             (($r.ttl // 0) | tostring)
         ] | .[]
     ' <<<"$1"
@@ -262,14 +301,56 @@ update_host_record() {
     check_success "$body" "update $type record"
 }
 
-# Build SvcParams string for an HTTPS record (only include hints we have).
-# Preserves alpn from the existing record when present; falls back to a
-# sensible default for newly-created records.
+flush_svcparam_token() {
+    local key="$1" token="$2" out="$3" token_key
+    [[ -z "$token" ]] && { printf '%s' "$out"; return 0; }
+    token_key="${token%%=*}"
+    if [[ "$token_key" == "$key" ]]; then
+        printf '%s' "$out"
+    elif [[ -z "$out" ]]; then
+        printf '%s' "$token"
+    else
+        printf '%s %s' "$out" "$token"
+    fi
+}
+
+svcparam_without_key() {
+    local value="$1" key="$2" token="" out="" ch
+    local in_quote=0 i
+    for (( i = 0; i < ${#value}; i++ )); do
+        ch="${value:i:1}"
+        if [[ "$ch" == '"' ]]; then
+            token+="$ch"
+            if (( in_quote )); then in_quote=0; else in_quote=1; fi
+        elif [[ "$ch" =~ [[:space:]] && $in_quote -eq 0 ]]; then
+            out=$(flush_svcparam_token "$key" "$token" "$out")
+            token=""
+        else
+            token+="$ch"
+        fi
+    done
+    flush_svcparam_token "$key" "$token" "$out"
+}
+
+svcparam_set_quoted() {
+    local value="$1" key="$2" new="$3"
+    value=$(svcparam_without_key "$value" "$key")
+    if [[ -z "$new" ]]; then
+        printf '%s' "$value"
+    elif [[ -z "$value" ]]; then
+        printf '%s="%s"' "$key" "$new"
+    else
+        printf '%s %s="%s"' "$value" "$key" "$new"
+    fi
+}
+
+# Build SvcParams string for an HTTPS record. Preserve every existing
+# SvcParam except the address hints refreshed by this run.
 https_value() {
-    local ipv4="$1" ipv6="$2" alpn="${3:-h3,h2}" value
-    value="alpn=\"$alpn\""
-    [[ -n "$ipv4" ]] && value+=" ipv4hint=\"$ipv4\""
-    [[ -n "$ipv6" ]] && value+=" ipv6hint=\"$ipv6\""
+    local ipv4="$1" ipv6="$2" value="${3:-}"
+    [[ -z "$value" ]] && value='alpn="h3,h2"'
+    value=$(svcparam_set_quoted "$value" ipv4hint "$ipv4")
+    value=$(svcparam_set_quoted "$value" ipv6hint "$ipv6")
     printf '%s' "$value"
 }
 
@@ -308,8 +389,7 @@ sync_host_record() {
     local type="$1" ip="$2" hc_url="$3"
     local response count cf_id cf_ip cf_proxied cf_ttl
 
-    response=$(get_records "$type")
-    check_success "$response" "list $type records" || return 1
+    response=$(get_records_checked "$type")
 
     count=$(record_count "$response")
     if (( count > 1 )); then
@@ -341,27 +421,22 @@ sync_host_record() {
     ping_hc "$hc_url"
 }
 
-# Failure trap: ping /fail only for families we attempted but did NOT mark
-# successful, so a partial run (A succeeded, AAAA failed) doesn't falsely
-# mark the A healthcheck as failed.
-on_error() {
-    local rc=$?
-    if [[ "$A_ATTEMPTED" = true && "$A_OK" = false && -n "$A_HC" ]]; then
-        "${CURL_GET[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
-    fi
-    if [[ "$AAAA_ATTEMPTED" = true && "$AAAA_OK" = false && -n "$AAAA_HC" ]]; then
-        "${CURL_GET[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
-    fi
-    exit "$rc"
-}
-
-# Exit trap: flush batched notification email so partial progress (e.g. a
-# successful A update before an AAAA failure) still gets reported.
+# Exit trap: ping failed attempted families and flush batched notification
+# email so partial progress (e.g. a successful A update before an AAAA
+# failure) still gets reported.
 # `set +e` so a "false" condition (e.g. empty NOTIFY_LINES) inside the trap
 # doesn't override the script's real exit status under `set -e`.
 on_exit() {
     local rc=$?
     set +e
+    if (( rc != 0 )); then
+        if [[ "$A_ATTEMPTED" = true && "$A_OK" = false && -n "$A_HC" ]]; then
+            "${CURL_GET[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
+        fi
+        if [[ "$AAAA_ATTEMPTED" = true && "$AAAA_OK" = false && -n "$AAAA_HC" ]]; then
+            "${CURL_GET[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
+        fi
+    fi
     if [[ ${#NOTIFY_LINES[@]} -gt 0 ]] && command -v sendmail >/dev/null; then
         local host date_hdr subject
         host=$(hostname -f 2>/dev/null || hostname)
@@ -380,7 +455,6 @@ on_exit() {
     fi
     exit "$rc"
 }
-trap on_error ERR
 trap on_exit EXIT
 
 # ---- argument parsing ----
@@ -400,7 +474,11 @@ if [[ $# -lt 1 || -z "${1:-}" ]]; then
     print_usage
     exit 1
 fi
-RECORD="$1"
+RECORD=$(normalize_record "$1")
+if ! valid_record "$RECORD"; then
+    err "Invalid FQDN: $1"
+    exit 1
+fi
 
 # If neither -4 nor -6 is specified, do both
 if [[ "$DO_IPV4" = false && "$DO_IPV6" = false ]]; then
@@ -409,9 +487,9 @@ if [[ "$DO_IPV4" = false && "$DO_IPV6" = false ]]; then
 fi
 
 # ---- preflight checks ----
-if ! command -v jq &> /dev/null; then
-    err "jq is not installed. Install it via 'apt install jq'."
-    exit 1
+require_cmd curl jq flock awk tr
+if [[ -n "${CLOUDFLARE_DDNS_AAAA_IFACE:-}" ]]; then
+    require_cmd ip
 fi
 
 if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ZONE_ID" ]]; then
@@ -419,8 +497,8 @@ if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ZONE_ID" ]]; then
     exit 1
 fi
 
-if ! [[ "$TTL" =~ ^[0-9]+$ ]] || ! { [[ "$TTL" == "1" ]] || (( TTL >= 120 && TTL <= 86400 )); }; then
-    err "TTL must be 1 (auto) or an integer between 120 and 86400"
+if ! [[ "$TTL" =~ ^[0-9]+$ ]] || ! { [[ "$TTL" == "1" ]] || (( TTL >= 60 && TTL <= 86400 )); }; then
+    err "TTL must be 1 (auto) or an integer between 60 and 86400"
     exit 1
 fi
 
@@ -462,9 +540,18 @@ if [[ "$DO_IPV6" = true ]]; then
     AAAA_ATTEMPTED=true
     if [[ -n "${CLOUDFLARE_DDNS_AAAA_IFACE:-}" ]]; then
         IPV6=$(ip -6 addr show dev "$CLOUDFLARE_DDNS_AAAA_IFACE" scope global \
-            | awk '/inet6/ { split($2,a,"/"); addr=a[1]; if (addr !~ /^fd/ && addr !~ /^fc/) { print addr; exit } }')
+            | awk '
+                /inet6/ {
+                    if ($0 ~ /(^|[[:space:]])(temporary|deprecated|tentative|dadfailed)([[:space:]]|$)/) next
+                    split($2,a,"/")
+                    addr=a[1]
+                    if (addr !~ /^(fd|fc)/ && addr !~ /^fe80:/) {
+                        print addr
+                        exit
+                    }
+                }')
         if [[ -z "$IPV6" ]]; then
-            err "No global IPv6 address found on interface $CLOUDFLARE_DDNS_AAAA_IFACE"
+            err "No stable global IPv6 address found on interface $CLOUDFLARE_DDNS_AAAA_IFACE"
             exit 1
         fi
     else
@@ -481,8 +568,7 @@ fi
 
 # ---- HTTPS record ----
 if [[ "$DO_HTTPS" = true ]]; then
-    https_resp=$(get_records HTTPS)
-    check_success "$https_resp" "list HTTPS records"
+    https_resp=$(get_records_checked HTTPS)
 
     https_count=$(record_count "$https_resp")
     if (( https_count > 1 )); then
@@ -493,8 +579,7 @@ if [[ "$DO_HTTPS" = true ]]; then
     { read -r cf_https_id
       read -r cf_ipv4hint
       read -r cf_ipv6hint
-      read -r cf_alpn
-      read -r cf_proxied
+      read -r cf_https_value
       read -r cf_https_ttl
     } < <(parse_https_record "$https_resp")
 
@@ -503,7 +588,7 @@ if [[ "$DO_HTTPS" = true ]]; then
     [[ "$DO_IPV4" = false ]] && IPV4="$cf_ipv4hint"
     [[ "$DO_IPV6" = false ]] && IPV6="$cf_ipv6hint"
 
-    new_value=$(https_value "$IPV4" "$IPV6" "$cf_alpn")
+    new_value=$(https_value "$IPV4" "$IPV6" "$cf_https_value")
 
     if [[ -z "$cf_https_id" ]]; then
         create_https_record "$new_value"
