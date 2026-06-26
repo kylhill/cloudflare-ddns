@@ -33,6 +33,7 @@ AAAA_OK=false
 USER_AGENT="cloudflare-ddns/2.3"
 
 CF_API="https://api.cloudflare.com/client/v4"
+CF_AUTH_CONFIG=""
 
 # Curl base options
 #   --fail-with-body : print body on HTTP error before exit
@@ -235,7 +236,7 @@ cf_api_get() {
         args+=(--data-urlencode "$kv")
     done
     "${CURL_GET[@]}" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        --config "$CF_AUTH_CONFIG" \
         -H "Content-Type: application/json" \
         "${args[@]}" \
         "$CF_API$path"
@@ -252,10 +253,26 @@ cf_api_mutate() {
     esac
     "${curl_cmd[@]}" \
         -X "$method" \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        --config "$CF_AUTH_CONFIG" \
         -H "Content-Type: application/json" \
         --data-binary "$data" \
         "$CF_API$path"
+}
+
+load_systemd_credentials() {
+    [[ -n "${CREDENTIALS_DIRECTORY:-}" ]] || return 0
+    if [[ -z "$CLOUDFLARE_API_TOKEN" && -r "$CREDENTIALS_DIRECTORY/cloudflare_api_token" ]]; then
+        CLOUDFLARE_API_TOKEN=$(<"$CREDENTIALS_DIRECTORY/cloudflare_api_token")
+    fi
+    if [[ -z "$CLOUDFLARE_ZONE_ID" && -r "$CREDENTIALS_DIRECTORY/cloudflare_zone_id" ]]; then
+        CLOUDFLARE_ZONE_ID=$(<"$CREDENTIALS_DIRECTORY/cloudflare_zone_id")
+    fi
+}
+
+create_curl_auth_config() {
+    CF_AUTH_CONFIG="$STATE_DIR/cloudflare-auth.curl"
+    umask 077
+    printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" >"$CF_AUTH_CONFIG"
 }
 
 verify_token() {
@@ -575,6 +592,7 @@ if [[ "$DO_IPV4" = false && "$DO_IPV6" = false ]]; then
 fi
 
 # ---- preflight checks ----
+load_systemd_credentials
 require_cmd curl jq flock awk tr
 if [[ -n "${CLOUDFLARE_DDNS_AAAA_IFACE:-}" ]]; then
     require_cmd ip
@@ -602,6 +620,7 @@ if [[ ! -d "$STATE_DIR" || ! -w "$STATE_DIR" ]]; then
     err "Runtime directory is not writable: $STATE_DIR"
     exit 1
 fi
+create_curl_auth_config
 # Sanitize record name so unusual input can't escape STATE_DIR
 RECORD_SAFE=${RECORD//[^A-Za-z0-9._-]/_}
 LOCK_FILE="$STATE_DIR/${RECORD_SAFE}.lock"

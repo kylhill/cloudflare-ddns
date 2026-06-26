@@ -40,12 +40,13 @@ The script is a single linear flow:
 
 1. **Argument parsing** (`getopts`) → sets `DO_IPV4`, `DO_IPV6`, `DO_HTTPS`, `TTL`, `QUIET`, `RECORD`
 2. **Preflight checks** — verifies required commands installed, env vars set, FQDN valid, TTL valid, `RUNTIME_DIRECTORY` set
-3. **Single-instance lock** via `flock` on `$RUNTIME_DIRECTORY/<record>.lock` — the script **requires** `RUNTIME_DIRECTORY` to be set (exported by systemd's `RuntimeDirectory=cloudflare-ddns`)
-4. **Token verification** — calls `GET /user/tokens/verify`
-5. **IP detection** (`get_ip -4|-6`) — tries three providers in order: `cloudflare cdn-cgi/trace`, `icanhazip.com`, `ifconfig.co`
-6. **DNS sync** (`sync_host_record`) — GET existing record, then create/PATCH/skip based on IP and TTL comparison
-7. **HTTPS record sync** (if `-s`) — preserves existing SvcParams and whichever hint wasn't refreshed this run
-8. **Exit trap** — pings `/fail` on Healthchecks.io for any attempted-but-failed family; emails `root` via `sendmail` if any changes were made
+3. **Credential loading** — reads `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ZONE_ID` from the environment, or from systemd credentials in `$CREDENTIALS_DIRECTORY`
+4. **Single-instance lock** via `flock` on `$RUNTIME_DIRECTORY/<record>.lock` — the script **requires** `RUNTIME_DIRECTORY` to be set (exported by systemd's `RuntimeDirectory=cloudflare-ddns`)
+5. **Token verification** — calls `GET /user/tokens/verify`
+6. **IP detection** (`get_ip -4|-6`) — tries three providers in order: `cloudflare cdn-cgi/trace`, `icanhazip.com`, `ifconfig.co`
+7. **DNS sync** (`sync_host_record`) — GET existing record, then create/PATCH/skip based on IP and TTL comparison
+8. **HTTPS record sync** (if `-s`) — preserves existing SvcParams and whichever hint wasn't refreshed this run
+9. **Exit trap** — pings `/fail` on Healthchecks.io for any attempted-but-failed family; emails `root` via `sendmail` if any changes were made
 
 ## Key Conventions
 
@@ -59,7 +60,7 @@ All curl profiles use `-q` to ignore user/global curl config files.
 
 **Mutate calls use `|| true`** — `cf_api_mutate` calls are followed by `|| true` so `set -e` doesn't fire before `check_success` can extract and display the API error body.
 
-**Secrets via environment** — `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` must come from the environment (not the script). The commented-out block at the top is for documentation only; never uncomment and commit real values.
+**Secrets via environment or systemd credentials** — `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` may come from the environment, or from systemd credential files named `cloudflare_api_token` and `cloudflare_zone_id` under `$CREDENTIALS_DIRECTORY`. The commented-out block at the top is for documentation only; never uncomment and commit real values.
 
 **Duplicate record guard** — If the API returns more than one record for a name+type, the script refuses to update and exits. Fix duplicates in the Cloudflare dashboard first.
 

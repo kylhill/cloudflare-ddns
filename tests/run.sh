@@ -49,6 +49,9 @@ while (($#)); do
             esac
             shift 2
             ;;
+        --config)
+            shift 2
+            ;;
         -4|-6)
             family="$1"
             shift
@@ -248,6 +251,25 @@ run_script() {
         "$SCRIPT" "$@" >"$output" 2>&1
 }
 
+run_script_with_systemd_credentials() {
+    local scenario="$1" output="$2"
+    shift 2
+    local runtime_dir="$TEST_TMP/runtime-$scenario"
+    local credentials_dir="$TEST_TMP/credentials-$scenario"
+    mkdir -p "$runtime_dir" "$credentials_dir"
+    printf 'test-token\n' >"$credentials_dir/cloudflare_api_token"
+    printf 'test-zone\n' >"$credentials_dir/cloudflare_zone_id"
+    PATH="$MOCKBIN:$PATH" \
+    TEST_SCENARIO="$scenario" \
+    TEST_CURL_LOG="$CURL_LOG" \
+    TEST_IP_LOG="$IP_LOG" \
+    TEST_SENDMAIL_LOG="$SENDMAIL_LOG" \
+    CLOUDFLARE_DDNS_AAAA_IFACE="" \
+    CREDENTIALS_DIRECTORY="$credentials_dir" \
+    RUNTIME_DIRECTORY="$runtime_dir" \
+        "$SCRIPT" "$@" >"$output" 2>&1
+}
+
 expect_success() {
     local name="$1" scenario="$2"
     shift 2
@@ -277,6 +299,17 @@ post_line=$(grep 'method=POST' "$CURL_LOG")
 [[ $(grep -c 'method=POST' "$CURL_LOG") -eq 1 ]] || fail "expected exactly one POST"
 [[ "$post_line" != *"--retry"* ]] || fail "POST curl command included --retry"
 assert_contains "$CURL_LOG" "raw=-q"
+assert_not_contains "$CURL_LOG" "Authorization: Bearer test-token"
+
+reset_logs
+credentials_output="$TEST_TMP/systemd credentials are supported.out"
+if ! run_script_with_systemd_credentials create_a "$credentials_output" -4 example.com; then
+    cat "$credentials_output" >&2
+    fail "systemd credentials are supported failed"
+fi
+assert_contains "$CURL_LOG" "--config"
+assert_not_contains "$CURL_LOG" "Authorization: Bearer test-token"
+printf 'ok - systemd credentials are supported\n'
 
 expect_failure "GET failure prints response body" get_failure -4 example.com
 assert_contains "$TEST_TMP/GET failure prints response body.out" "Cloudflare API request failed while listing A records:"

@@ -15,7 +15,7 @@ Options:
   -6  Only update AAAA record with external IPv6 address
 ```
 
-## Required environment
+## Required credentials
 
 | Variable                | Purpose                                       |
 | ----------------------- | --------------------------------------------- |
@@ -23,6 +23,10 @@ Options:
 | `CLOUDFLARE_ZONE_ID`    | Zone ID containing the record to update       |
 | `A_HC` *(optional)*     | Healthchecks.io URL for the A record run      |
 | `AAAA_HC` *(optional)*  | Healthchecks.io URL for the AAAA record run   |
+
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` can be provided as environment
+variables or as systemd credentials named `cloudflare_api_token` and
+`cloudflare_zone_id`.
 
 ## Dependencies
 
