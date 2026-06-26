@@ -133,7 +133,50 @@ valid_ipv4() {
 }
 
 valid_ipv6() {
-    [[ "$1" =~ ^[0-9a-fA-F:]+$ && "$1" == *:* ]]
+    local ip="$1" head tail part
+    local -a head_parts tail_parts parts
+    [[ -n "$ip" && "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+
+    if [[ "$ip" == *.* ]]; then
+        local ipv4_part="${ip##*:}"
+        valid_ipv4 "$ipv4_part" || return 1
+        ip="${ip%:*}:0:0"
+    fi
+
+    if [[ "$ip" == *::* ]]; then
+        [[ "$ip" != *::*::* ]] || return 1
+        head="${ip%%::*}"
+        tail="${ip#*::}"
+        if [[ -z "$head" ]]; then
+            head_parts=()
+        else
+            IFS=: read -r -a head_parts <<<"$head"
+        fi
+        if [[ -z "$tail" ]]; then
+            tail_parts=()
+        else
+            IFS=: read -r -a tail_parts <<<"$tail"
+        fi
+        parts=("${head_parts[@]}" "${tail_parts[@]}")
+        ((${#parts[@]} < 8)) || return 1
+    else
+        IFS=: read -r -a parts <<<"$ip"
+        ((${#parts[@]} == 8)) || return 1
+    fi
+
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    return 0
+}
+
+valid_ip_for_family() {
+    case "$1" in
+        -4) valid_ipv4 "$2" ;;
+        -6) valid_ipv6 "$2" ;;
+        *) return 1 ;;
+    esac
 }
 
 # Fetch external IP for the given family from one of several providers.
@@ -156,10 +199,11 @@ get_ip() {
         else
             ip=$(printf '%s' "$ip" | tr -d '[:space:]')
         fi
-        if [[ -n "$ip" ]]; then
+        if valid_ip_for_family "$family" "$ip"; then
             printf '%s' "$ip"
             return 0
         fi
+        last_err="invalid response from $url: $ip"
     done
     err "Failed to determine external IP ($family). Last error: $last_err"
     return 1
@@ -244,7 +288,11 @@ get_records() {
 # Refuse to proceed if more than one record matches; safer than silently
 # updating only the first.
 record_count() {
-    jq -r '.result_info.total_count // (.result | length)' <<<"$1"
+    jq -r '.result | length' <<<"$1"
+}
+
+record_result_pages() {
+    jq -r '.result_info.total_pages // 1' <<<"$1"
 }
 
 # Parse id + content + proxied + ttl from result[0]. Outputs four lines.
@@ -256,26 +304,58 @@ parse_record() {
     ' <<<"$1"
 }
 
-# Parse id + ipv4hint + ipv6hint + value + ttl from an HTTPS result[0].
-# Outputs five lines. Hints are extracted from the SvcParams string so
-# comparison is robust to whitespace / ordering / quoting differences from
+# Parse id + value + priority + target + ttl from an HTTPS result[0].
+# Outputs five lines. Hints are extracted from the SvcParams string in Bash
+# so comparison is robust to whitespace / ordering / quoting differences from
 # the API.
 parse_https_record() {
     jq -r '
-        # `?` swallows capture errors (no match) into an empty stream;
-        # `// ""` then supplies the empty-string default. Without the `?`
-        # an absent hint would abort jq entirely.
-        def cap($re): (capture($re).v)? // "";
         .result[0] // {} as $r |
         ($r.data.value // "") as $v |
         [
             ($r.id // ""),
-            ($v | cap("ipv4hint=\"(?<v>[^\"]+)\"")),
-            ($v | cap("ipv6hint=\"(?<v>[^\"]+)\"")),
             $v,
+            (($r.data.priority // 1) | tostring),
+            ($r.data.target // "."),
             (($r.ttl // 0) | tostring)
         ] | .[]
     ' <<<"$1"
+}
+
+svcparam_token_value() {
+    local token="$1" token_value
+    [[ "$token" == *=* ]] || return 1
+    token_value="${token#*=}"
+    if [[ "$token_value" == \"*\" && "$token_value" == *\" ]]; then
+        token_value="${token_value#\"}"
+        token_value="${token_value%\"}"
+    fi
+    printf '%s' "$token_value"
+}
+
+svcparam_get() {
+    local value="$1" key="$2" token="" ch token_key
+    local in_quote=0 i
+    for (( i = 0; i < ${#value}; i++ )); do
+        ch="${value:i:1}"
+        if [[ "$ch" == '"' ]]; then
+            token+="$ch"
+            if (( in_quote )); then in_quote=0; else in_quote=1; fi
+        elif [[ "$ch" =~ [[:space:]] && $in_quote -eq 0 ]]; then
+            token_key="${token%%=*}"
+            if [[ "$token_key" == "$key" ]]; then
+                svcparam_token_value "$token"
+                return 0
+            fi
+            token=""
+        else
+            token+="$ch"
+        fi
+    done
+    token_key="${token%%=*}"
+    if [[ "$token_key" == "$key" ]]; then
+        svcparam_token_value "$token"
+    fi
 }
 
 # Note: `|| true` on the mutate call so a non-2xx response (curl exits
@@ -355,12 +435,14 @@ https_value() {
 }
 
 https_record_data() {
-    local value="$1"
+    local value="$1" priority="${2:-1}" target="${3:-.}"
     # NOTE: HTTPS records do not accept a `proxied` field; sending it makes
     # the Cloudflare API reject the create/update request.
-    jq -nc --arg name "$RECORD" --arg value "$value" --argjson ttl "$TTL" \
+    jq -nc \
+        --arg name "$RECORD" --arg value "$value" --arg target "$target" \
+        --argjson ttl "$TTL" --argjson priority "$priority" \
         '{type:"HTTPS", name:$name, ttl:$ttl,
-          data:{priority:1, target:".", value:$value}}'
+          data:{priority:$priority, target:$target, value:$value}}'
 }
 
 create_https_record() {
@@ -371,8 +453,8 @@ create_https_record() {
 }
 
 update_https_record() {
-    local id="$1" value="$2" data body
-    data=$(https_record_data "$value")
+    local id="$1" value="$2" priority="$3" target="$4" data body
+    data=$(https_record_data "$value" "$priority" "$target")
     body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data") || true
     check_success "$body" "update HTTPS record"
 }
@@ -387,9 +469,15 @@ ping_hc() {
 # Usage: sync_host_record TYPE IP HC_URL
 sync_host_record() {
     local type="$1" ip="$2" hc_url="$3"
-    local response count cf_id cf_ip cf_proxied cf_ttl
+    local response count pages cf_id cf_ip cf_proxied cf_ttl
 
     response=$(get_records_checked "$type")
+
+    pages=$(record_result_pages "$response")
+    if (( pages > 1 )); then
+        err "Found more than one page of $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+        return 1
+    fi
 
     count=$(record_count "$response")
     if (( count > 1 )); then
@@ -510,6 +598,10 @@ if [[ -z "${RUNTIME_DIRECTORY:-}" ]]; then
     exit 1
 fi
 STATE_DIR="${RUNTIME_DIRECTORY%%:*}"
+if [[ ! -d "$STATE_DIR" || ! -w "$STATE_DIR" ]]; then
+    err "Runtime directory is not writable: $STATE_DIR"
+    exit 1
+fi
 # Sanitize record name so unusual input can't escape STATE_DIR
 RECORD_SAFE=${RECORD//[^A-Za-z0-9._-]/_}
 LOCK_FILE="$STATE_DIR/${RECORD_SAFE}.lock"
@@ -570,6 +662,12 @@ fi
 if [[ "$DO_HTTPS" = true ]]; then
     https_resp=$(get_records_checked HTTPS)
 
+    https_pages=$(record_result_pages "$https_resp")
+    if (( https_pages > 1 )); then
+        err "Found more than one page of HTTPS records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+        exit 1
+    fi
+
     https_count=$(record_count "$https_resp")
     if (( https_count > 1 )); then
         err "Found $https_count HTTPS records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
@@ -577,11 +675,13 @@ if [[ "$DO_HTTPS" = true ]]; then
     fi
 
     { read -r cf_https_id
-      read -r cf_ipv4hint
-      read -r cf_ipv6hint
       read -r cf_https_value
+      read -r cf_https_priority
+      read -r cf_https_target
       read -r cf_https_ttl
     } < <(parse_https_record "$https_resp")
+    cf_ipv4hint=$(svcparam_get "$cf_https_value" ipv4hint) || cf_ipv4hint=""
+    cf_ipv6hint=$(svcparam_get "$cf_https_value" ipv6hint) || cf_ipv6hint=""
 
     # If a family wasn't refreshed in this run (e.g. -4-only), preserve the
     # existing hint from Cloudflare so we don't silently drop it.
@@ -595,11 +695,11 @@ if [[ "$DO_HTTPS" = true ]]; then
         printf '%sCreated new HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
         NOTIFY_LINES+=("Created HTTPS record for $RECORD")
     elif [[ "$cf_ipv4hint" != "$IPV4" || "$cf_ipv6hint" != "$IPV6" ]]; then
-        update_https_record "$cf_https_id" "$new_value"
+        update_https_record "$cf_https_id" "$new_value" "$cf_https_priority" "$cf_https_target"
         printf '%sUpdated HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
         NOTIFY_LINES+=("Updated HTTPS record for $RECORD (ipv4hint=$IPV4 ipv6hint=$IPV6)")
     elif [[ "$cf_https_ttl" != "$TTL" ]]; then
-        update_https_record "$cf_https_id" "$new_value"
+        update_https_record "$cf_https_id" "$new_value" "$cf_https_priority" "$cf_https_target"
         printf '%sUpdated TTL of HTTPS record for %s from %s to %s%s\n' \
             "$C_PURPLE" "$RECORD" "$cf_https_ttl" "$TTL" "$C_RESET"
         NOTIFY_LINES+=("Updated TTL of HTTPS record for $RECORD: $cf_https_ttl -> $TTL")

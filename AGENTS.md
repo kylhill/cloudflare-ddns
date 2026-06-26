@@ -27,11 +27,12 @@ Run `bash -n tests/run.sh` after editing the harness itself. The harness is self
 The harness covers:
 - record creation without POST retries
 - Cloudflare GET failure body reporting
-- duplicate detection from `result_info.total_count`
+- duplicate detection from filtered results and multi-page exact-query refusal
 - TTL `60` acceptance and PATCH payloads
 - lowercase/exact record queries
+- invalid IP provider output fallback
 - interface-derived IPv6 filtering
-- HTTPS SvcParams preservation while refreshing address hints
+- HTTPS SvcParams, priority, and target preservation while refreshing address hints
 
 ## Architecture
 
