@@ -39,6 +39,11 @@ CLOUDFLARE_DDNS_A_SOURCE=interface:wan
 CLOUDFLARE_DDNS_AAAA_SOURCE=interface:lan
 ```
 
+The script fetches and validates every requested record first, plans all A,
+AAAA, and HTTPS changes, and submits them through one Cloudflare DNS batch
+request. If nothing changed, it skips the batch request. A lost batch response
+is not retried automatically because the outcome may be ambiguous.
+
 ## Dependencies
 
 - `bash`, `curl`, `jq`, `flock`, `awk`, `tr`

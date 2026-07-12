@@ -181,11 +181,75 @@ if [[ "$method" == GET && "$url" == */dns_records ]]; then
                 records_response 0 '[]'
             fi
             ;;
+        https_preserve_v6)
+            if [[ "$type" == AAAA ]]; then
+                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+            elif [[ "$type" == HTTPS ]]; then
+                jq -nc --arg value 'alpn="h3,h2" port="8443" ipv4hint=198.51.100.9 ipv6hint=2001:db8::1' \
+                    '{success:true, result:[{id:"H1", type:"HTTPS", ttl:3600, data:{priority:3, target:"svc6.example.com", value:$value}}], result_info:{count:1, total_count:1, total_pages:1}}'
+            else
+                records_response 0 '[]'
+            fi
+            ;;
+        batch_all|batch_failure|batch_timeout)
+            if [[ "$type" == A ]]; then
+                records_response 1 "[$(json_record A1 198.51.100.1 false 3600)]"
+            elif [[ "$type" == AAAA ]]; then
+                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+            else
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=198.51.100.1 ipv6hint=2001:db8::1' 3600)]"
+            fi
+            ;;
+        only_aaaa)
+            if [[ "$type" == A ]]; then
+                records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+            elif [[ "$type" == AAAA ]]; then
+                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+            else
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=198.51.100.42 ipv6hint=2001:db8::42' 3600)]"
+            fi
+            ;;
+        no_change)
+            if [[ "$type" == A ]]; then
+                records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+            elif [[ "$type" == AAAA ]]; then
+                records_response 1 "[$(json_record AAAA1 2001:db8::42 false 3600)]"
+            else
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=198.51.100.42 ipv6hint=2001:db8::42' 3600)]"
+            fi
+            ;;
+        mixed_create_update)
+            if [[ "$type" == A ]]; then
+                records_response 0 '[]'
+            else
+                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+            fi
+            ;;
+        duplicate_https)
+            if [[ "$type" == A ]]; then
+                records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+            else
+                records_response 2 "[$(json_https_record H1 'alpn="h3"' 3600),$(json_https_record H2 'alpn="h2"' 3600)]"
+            fi
+            ;;
         *)
             printf 'unknown TEST_SCENARIO: %s\n' "${TEST_SCENARIO:-}" >&2
             exit 64
             ;;
     esac
+    exit 0
+fi
+
+if [[ "$method" == POST && "$url" == */dns_records/batch ]]; then
+    if [[ "${TEST_SCENARIO:-}" == batch_timeout ]]; then
+        exit 28
+    fi
+    if [[ "${TEST_SCENARIO:-}" == batch_failure ]]; then
+        printf '{"success":false,"errors":[{"code":1004,"message":"invalid HTTPS fixture"}]}\n'
+        exit 0
+    fi
+    jq -nc --argjson request "$data" \
+        '{success:true,result:{patches:[$request.patches[]? | {id:.id}],posts:[$request.posts[]? | {id:"created"}]}}'
     exit 0
 fi
 
@@ -245,9 +309,11 @@ run_script() {
     shift 2
     local runtime_dir="$TEST_TMP/runtime-$scenario"
     local ipv6_iface="" ipv4_iface=""
+    local a_hc="" aaaa_hc=""
     mkdir -p "$runtime_dir"
     [[ "$scenario" == ipv6_iface ]] && ipv6_iface="eth0"
     [[ "$scenario" == ipv4_iface ]] && ipv4_iface="wan"
+    [[ "$scenario" == no_change ]] && { a_hc="http://hc.example/a"; aaaa_hc="http://hc.example/aaaa"; }
     PATH="$MOCKBIN:$PATH" \
     TEST_SCENARIO="$scenario" \
     TEST_CURL_LOG="$CURL_LOG" \
@@ -255,6 +321,8 @@ run_script() {
     TEST_SENDMAIL_LOG="$SENDMAIL_LOG" \
     CLOUDFLARE_API_TOKEN="test-token" \
     CLOUDFLARE_ZONE_ID="test-zone" \
+    A_HC="$a_hc" \
+    AAAA_HC="$aaaa_hc" \
     CLOUDFLARE_DDNS_A_SOURCE="${ipv4_iface:+interface:$ipv4_iface}" \
     CLOUDFLARE_DDNS_AAAA_SOURCE="${ipv6_iface:+interface:$ipv6_iface}" \
     RUNTIME_DIRECTORY="$runtime_dir" \
@@ -309,6 +377,7 @@ expect_success "create A does not retry POST" create_a -4 example.com
 post_line=$(grep 'method=POST' "$CURL_LOG")
 [[ $(grep -c 'method=POST' "$CURL_LOG") -eq 1 ]] || fail "expected exactly one POST"
 [[ "$post_line" != *"--retry"* ]] || fail "POST curl command included --retry"
+[[ "$post_line" == *'/dns_records/batch'* ]] || fail "creation did not use batch endpoint"
 assert_contains "$CURL_LOG" "raw=-q"
 assert_not_contains "$CURL_LOG" "Authorization: Bearer test-token"
 
@@ -341,7 +410,7 @@ assert_not_contains "$CURL_LOG" "method=PATCH"
 assert_not_contains "$CURL_LOG" "method=POST"
 
 expect_success "TTL 60 is accepted and patched" ttl60 -4 -t 60 example.com
-patch_line=$(grep 'method=PATCH' "$CURL_LOG")
+patch_line=$(grep '/dns_records/batch' "$CURL_LOG")
 [[ "$patch_line" == *'"ttl":60'* ]] || fail "PATCH payload did not set ttl 60"
 [[ "$patch_line" == *'"proxied":false'* ]] || fail "PATCH payload did not disable proxying"
 assert_not_contains "$CURL_LOG" '"content":"198.51.100.42"'
@@ -364,12 +433,49 @@ assert_contains "$TEST_TMP/interface IPv4 is selected and source-bound verified.
 assert_contains "$CURL_LOG" "--interface 8.8.4.4"
 
 expect_success "HTTPS update preserves unrelated SvcParams" https_preserve -4 -s example.com
-https_patch=$(grep 'method=PATCH' "$CURL_LOG" | tail -n 1)
+https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
 [[ "$https_patch" == *'port=\"8443\"'* ]] || fail "HTTPS payload did not preserve port"
 [[ "$https_patch" == *'ech=\"abc\"'* ]] || fail "HTTPS payload did not preserve ech"
 [[ "$https_patch" == *'ipv4hint=\"198.51.100.42\"'* ]] || fail "HTTPS payload did not refresh ipv4hint"
 [[ "$https_patch" == *'ipv6hint=\"2001:db8::1\"'* ]] || fail "HTTPS payload did not preserve ipv6hint"
 [[ "$https_patch" == *'"priority":2'* ]] || fail "HTTPS payload did not preserve priority"
 [[ "$https_patch" == *'"target":"svc.example.com"'* ]] || fail "HTTPS payload did not preserve target"
+
+expect_success "IPv6-only HTTPS update preserves IPv4 hint" https_preserve_v6 -6 -s example.com
+https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
+[[ "$https_patch" == *'ipv4hint=\"198.51.100.9\"'* ]] || fail "HTTPS payload did not preserve ipv4hint"
+[[ "$https_patch" == *'ipv6hint=\"2001:db8::42\"'* ]] || fail "HTTPS payload did not refresh ipv6hint"
+
+expect_success "A AAAA and HTTPS changes use one batch" batch_all -s example.com
+[[ $(grep -c '/dns_records/batch' "$CURL_LOG") -eq 1 ]] || fail "expected one batch request"
+batch_line=$(grep '/dns_records/batch' "$CURL_LOG")
+[[ "$batch_line" == *'"id":"A1"'* && "$batch_line" == *'"id":"AAAA1"'* && "$batch_line" == *'"id":"H1"'* ]] || fail "batch omitted a planned record"
+
+expect_success "only AAAA drift produces one patch" only_aaaa -s example.com
+batch_line=$(grep '/dns_records/batch' "$CURL_LOG")
+[[ "$batch_line" == *'"id":"AAAA1"'* ]] || fail "AAAA patch missing"
+[[ "$batch_line" != *'"id":"A1"'* && "$batch_line" != *'"id":"H1"'* ]] || fail "unchanged record was included"
+
+expect_success "no changes skips batch and pings healthchecks" no_change -s example.com
+assert_not_contains "$CURL_LOG" "/dns_records/batch"
+assert_contains "$CURL_LOG" "http://hc.example/a"
+assert_contains "$CURL_LOG" "http://hc.example/aaaa"
+
+expect_success "missing A and changed AAAA share one batch" mixed_create_update example.com
+batch_line=$(grep '/dns_records/batch' "$CURL_LOG")
+[[ "$batch_line" == *'"posts":[{"type":"A"'* ]] || fail "A post missing from mixed batch"
+[[ "$batch_line" == *'"patches":[{"id":"AAAA1"'* ]] || fail "AAAA patch missing from mixed batch"
+
+expect_failure "duplicate HTTPS prevents batch" duplicate_https -4 -s example.com
+assert_contains "$TEST_TMP/duplicate HTTPS prevents batch.out" "Found 2 HTTPS records"
+assert_not_contains "$CURL_LOG" "/dns_records/batch"
+
+expect_failure "batch operation error reports no completed changes" batch_failure -s example.com
+assert_contains "$TEST_TMP/batch operation error reports no completed changes.out" "invalid HTTPS fixture"
+assert_not_contains "$TEST_TMP/batch operation error reports no completed changes.out" "Updated A record"
+
+expect_failure "batch timeout is not retried" batch_timeout -s example.com
+[[ $(grep -c '/dns_records/batch' "$CURL_LOG") -eq 1 ]] || fail "timed-out batch was retried"
+assert_contains "$TEST_TMP/batch timeout is not retried.out" "outcome may be ambiguous"
 
 printf 'All tests passed.\n'

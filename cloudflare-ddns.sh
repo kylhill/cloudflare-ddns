@@ -53,8 +53,6 @@ CURL_GET=("${CURL_BASE[@]}" --retry 5 --retry-delay 2 --retry-max-time 30 --retr
 # POSTs (record creation) are NOT idempotent: a transient error on a
 # request that actually reached Cloudflare could create a duplicate on retry.
 CURL_POST=("${CURL_BASE[@]}")
-# PATCH (record update) is idempotent, so retry liberally on any error.
-CURL_PATCH=("${CURL_BASE[@]}" --retry 3 --retry-delay 2 --retry-max-time 20 --retry-all-errors)
 # IP detection: tight timeout, single retry; we already iterate fallbacks
 CURL_IP=(
     curl -q -sS --fail-with-body -A "$USER_AGENT"
@@ -75,6 +73,10 @@ fi
 
 # Notification batch (one mail per run)
 NOTIFY_LINES=()
+PLANNED_OUTPUT=()
+PLANNED_NOTIFY=()
+PATCHES_JSON='[]'
+POSTS_JSON='[]'
 
 print_usage() {
     cat <<EOF
@@ -322,21 +324,16 @@ cf_api_get() {
         "$CF_API$path"
 }
 
-# Usage: cf_api_mutate METHOD PATH DATA
-cf_api_mutate() {
-    local method="$1" path="$2" data="$3"
-    local -a curl_cmd
-    case "$method" in
-        POST)        curl_cmd=("${CURL_POST[@]}") ;;
-        PATCH|PUT)   curl_cmd=("${CURL_PATCH[@]}") ;;
-        *)           err "cf_api_mutate: unsupported method '$method'"; return 2 ;;
-    esac
-    "${curl_cmd[@]}" \
-        -X "$method" \
+# Batch creation is transactional at Cloudflare's database layer, but a POST
+# whose response is lost has an ambiguous outcome and therefore must not retry.
+cf_api_batch() {
+    local data="$1"
+    "${CURL_POST[@]}" \
+        -X POST \
         --config "$CF_AUTH_CONFIG" \
         -H "Content-Type: application/json" \
         --data-binary "$data" \
-        "$CF_API$path"
+        "$CF_API/zones/$CLOUDFLARE_ZONE_ID/dns_records/batch"
 }
 
 load_systemd_credentials() {
@@ -456,23 +453,57 @@ svcparam_get() {
     fi
 }
 
-# Note: `|| true` on the mutate call so a non-2xx response (curl exits
-# non-zero under --fail-with-body) doesn't trip `set -e` before
-# check_success can surface the API error message.
-create_host_record() {
-    local type="$1" ip="$2" proxied="$3" data body
-    data=$(jq -nc \
-        --arg type "$type" --arg name "$RECORD" --arg ip "$ip" \
-        --argjson ttl "$TTL" --argjson proxied "$proxied" \
-        '{type:$type, name:$name, content:$ip, ttl:$ttl, proxied:$proxied}')
-    body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data") || true
-    check_success "$body" "create $type record"
+append_batch_patch() { PATCHES_JSON=$(jq -c --argjson op "$1" '. + [$op]' <<<"$PATCHES_JSON"); }
+append_batch_post()  { POSTS_JSON=$(jq -c --argjson op "$1" '. + [$op]' <<<"$POSTS_JSON"); }
+
+validate_single_record() {
+    local type="$1" response="$2" pages count
+    pages=$(record_result_pages "$response")
+    if (( pages > 1 )); then
+        err "Found more than one page of $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+        return 1
+    fi
+    count=$(record_count "$response")
+    if (( count > 1 )); then
+        err "Found $count $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+        return 1
+    fi
 }
 
-update_host_record() {
-    local id="$1" data="$2" body
-    body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data") || true
-    check_success "$body" "update host record"
+plan_host_record() {
+    local type="$1" ip="$2" response="$3"
+    local cf_id cf_ip cf_proxied cf_ttl data message output
+    validate_single_record "$type" "$response"
+    { read -r cf_id; read -r cf_ip; read -r cf_proxied; read -r cf_ttl; } < <(parse_record "$response")
+
+    if [[ -z "$cf_id" ]]; then
+        data=$(jq -nc --arg type "$type" --arg name "$RECORD" --arg ip "$ip" \
+            --argjson ttl "$TTL" '{type:$type, name:$name, content:$ip, ttl:$ttl, proxied:false}')
+        append_batch_post "$data"
+        output="Created new $type record for $RECORD, $ip"
+        message="Created $type record for $RECORD: $ip"
+    elif [[ "$ip" != "$cf_ip" || "$cf_ttl" != "$TTL" || "$cf_proxied" != false ]]; then
+        data=$(jq -nc --arg id "$cf_id" '{id:$id}')
+        [[ "$ip" != "$cf_ip" ]] && data=$(jq -c --arg value "$ip" '.content=$value' <<<"$data")
+        [[ "$cf_ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
+        [[ "$cf_proxied" != false ]] && data=$(jq -c '.proxied=false' <<<"$data")
+        append_batch_patch "$data"
+        if [[ "$ip" != "$cf_ip" ]]; then
+            output="Updated $type record for $RECORD from $cf_ip to $ip"
+            message="Updated $type record for $RECORD: $cf_ip -> $ip"
+        elif [[ "$cf_ttl" != "$TTL" ]]; then
+            output="Updated TTL of $type record for $RECORD from $cf_ttl to $TTL"
+            message="Updated TTL of $type record for $RECORD: $cf_ttl -> $TTL"
+        else
+            output="Disabled Cloudflare proxying for $type record $RECORD"
+            message="Disabled proxying for $type record $RECORD"
+        fi
+    else
+        qprint "${C_YELLOW}No change to $type record for $RECORD, $cf_ip${C_RESET}"
+        return 0
+    fi
+    PLANNED_OUTPUT+=("$output")
+    PLANNED_NOTIFY+=("$message")
 }
 
 flush_svcparam_token() {
@@ -539,18 +570,38 @@ https_record_data() {
           data:{priority:$priority, target:$target, value:$value}}'
 }
 
-create_https_record() {
-    local value="$1" data body
-    data=$(https_record_data "$value")
-    body=$(cf_api_mutate POST "/zones/$CLOUDFLARE_ZONE_ID/dns_records" "$data") || true
-    check_success "$body" "create HTTPS record"
-}
+plan_https_record() {
+    local ipv4="$1" ipv6="$2" response="$3"
+    local id value priority target ttl old4 old6 new_value data output message
+    validate_single_record HTTPS "$response"
+    { read -r id; read -r value; read -r priority; read -r target; read -r ttl; } < <(parse_https_record "$response")
+    old4=$(svcparam_get "$value" ipv4hint) || old4=""
+    old6=$(svcparam_get "$value" ipv6hint) || old6=""
+    [[ "$DO_IPV4" = false ]] && ipv4="$old4"
+    [[ "$DO_IPV6" = false ]] && ipv6="$old6"
+    new_value=$(https_value "$ipv4" "$ipv6" "$value")
 
-update_https_record() {
-    local id="$1" value="$2" priority="$3" target="$4" data body
-    data=$(https_record_data "$value" "$priority" "$target")
-    body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data") || true
-    check_success "$body" "update HTTPS record"
+    if [[ -z "$id" ]]; then
+        data=$(https_record_data "$new_value")
+        append_batch_post "$data"
+        output="Created new HTTPS record for $RECORD"
+        message="Created HTTPS record for $RECORD"
+    elif [[ "$old4" != "$ipv4" || "$old6" != "$ipv6" || "$ttl" != "$TTL" ]]; then
+        data=$(jq -nc --arg id "$id" '{id:$id}')
+        if [[ "$old4" != "$ipv4" || "$old6" != "$ipv6" ]]; then
+            data=$(jq -c --arg value "$new_value" --arg target "$target" --argjson priority "$priority" \
+                '.data={priority:$priority,target:$target,value:$value}' <<<"$data")
+        fi
+        [[ "$ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
+        append_batch_patch "$data"
+        output="Updated HTTPS record for $RECORD"
+        message="Updated HTTPS record for $RECORD (ipv4hint=$ipv4 ipv6hint=$ipv6)"
+    else
+        qprint "${C_YELLOW}No change to HTTPS record for $RECORD${C_RESET}"
+        return 0
+    fi
+    PLANNED_OUTPUT+=("$output")
+    PLANNED_NOTIFY+=("$message")
 }
 
 ping_hc() {
@@ -559,55 +610,29 @@ ping_hc() {
     "${CURL_GET[@]}" -o /dev/null "$url" || err "Healthcheck ping to $url failed"
 }
 
-# Update or create a host (A/AAAA) record
-# Usage: sync_host_record TYPE IP HC_URL
-sync_host_record() {
-    local type="$1" ip="$2" hc_url="$3"
-    local response count pages cf_id cf_ip cf_proxied cf_ttl
-
-    response=$(get_records_checked "$type")
-
-    pages=$(record_result_pages "$response")
-    if (( pages > 1 )); then
-        err "Found more than one page of $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+submit_dns_batch() {
+    local batch body expected_patches expected_posts actual_patches actual_posts
+    expected_patches=$(jq 'length' <<<"$PATCHES_JSON")
+    expected_posts=$(jq 'length' <<<"$POSTS_JSON")
+    batch=$(jq -nc --argjson patches "$PATCHES_JSON" --argjson posts "$POSTS_JSON" \
+        '{patches:$patches, posts:$posts}')
+    if ! body=$(cf_api_batch "$batch"); then
+        err "Cloudflare DNS batch request failed; its outcome may be ambiguous. Check Cloudflare state before retrying."
+        [[ -n "$body" ]] && printf '%s\n' "$body" >&2
         return 1
     fi
-
-    count=$(record_count "$response")
-    if (( count > 1 )); then
-        err "Found $count $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+    check_success "$body" "DNS batch update"
+    if ! jq -e '((.errors // []) | length) == 0' <<<"$body" >/dev/null; then
+        err "Cloudflare DNS batch response contained operation errors:"
+        jq -r '.errors[]? | "  [\(.code)] \(.message)"' <<<"$body" >&2
         return 1
     fi
-
-    { read -r cf_id; read -r cf_ip; read -r cf_proxied; read -r cf_ttl; } < <(parse_record "$response")
-
-    if [[ -z "$cf_id" ]]; then
-        create_host_record "$type" "$ip" false
-        printf '%sCreated new %s record for %s, %s%s\n' "$C_PURPLE" "$type" "$RECORD" "$ip" "$C_RESET"
-        NOTIFY_LINES+=("Created $type record for $RECORD: $ip")
-    elif [[ "$ip" != "$cf_ip" || "$cf_ttl" != "$TTL" || "$cf_proxied" != false ]]; then
-        local data='{}'
-        [[ "$ip" != "$cf_ip" ]] && data=$(jq -c --arg value "$ip" '.content=$value' <<<"$data")
-        [[ "$cf_ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
-        [[ "$cf_proxied" != false ]] && data=$(jq -c '.proxied=false' <<<"$data")
-        update_host_record "$cf_id" "$data"
-        if [[ "$ip" != "$cf_ip" ]]; then
-        printf '%sUpdated %s record for %s from %s to %s%s\n' \
-            "$C_PURPLE" "$type" "$RECORD" "$cf_ip" "$ip" "$C_RESET"
-        NOTIFY_LINES+=("Updated $type record for $RECORD: $cf_ip -> $ip")
-        elif [[ "$cf_ttl" != "$TTL" ]]; then
-        printf '%sUpdated TTL of %s record for %s from %s to %s%s\n' \
-            "$C_PURPLE" "$type" "$RECORD" "$cf_ttl" "$TTL" "$C_RESET"
-        NOTIFY_LINES+=("Updated TTL of $type record for $RECORD: $cf_ttl -> $TTL")
-        else
-            printf '%sDisabled Cloudflare proxying for %s record %s%s\n' "$C_PURPLE" "$type" "$RECORD" "$C_RESET"
-            NOTIFY_LINES+=("Disabled proxying for $type record $RECORD")
-        fi
-    else
-        qprint "${C_YELLOW}No change to $type record for $RECORD, $cf_ip${C_RESET}"
+    actual_patches=$(jq -r '.result.patches // [] | length' <<<"$body")
+    actual_posts=$(jq -r '.result.posts // [] | length' <<<"$body")
+    if (( actual_patches != expected_patches || actual_posts != expected_posts )); then
+        err "Cloudflare DNS batch response did not account for every planned operation"
+        return 1
     fi
-
-    ping_hc "$hc_url"
 }
 
 # Exit trap: ping failed attempted families and flush batched notification
@@ -730,9 +755,25 @@ fi
 # ---- API token sanity check ----
 verify_token
 
-# ---- A record ----
+# ---- fetch and validate current records before planning any mutations ----
+A_RESPONSE=''; AAAA_RESPONSE=''; HTTPS_RESPONSE=''
 if [[ "$DO_IPV4" = true ]]; then
     A_ATTEMPTED=true
+    A_RESPONSE=$(get_records_checked A)
+    validate_single_record A "$A_RESPONSE"
+fi
+if [[ "$DO_IPV6" = true ]]; then
+    AAAA_ATTEMPTED=true
+    AAAA_RESPONSE=$(get_records_checked AAAA)
+    validate_single_record AAAA "$AAAA_RESPONSE"
+fi
+if [[ "$DO_HTTPS" = true ]]; then
+    HTTPS_RESPONSE=$(get_records_checked HTTPS)
+    validate_single_record HTTPS "$HTTPS_RESPONSE"
+fi
+
+# ---- discover and validate every requested address ----
+if [[ "$DO_IPV4" = true ]]; then
     if [[ "$A_SOURCE" == interface:* ]]; then
         IPV4=$(select_interface_ipv4 "${A_SOURCE#interface:}")
         verify_interface_ip -4 "$IPV4"
@@ -744,16 +785,11 @@ if [[ "$DO_IPV4" = true ]]; then
         exit 1
     fi
     qprint "Current IPv4 is $IPV4"
-    sync_host_record A "$IPV4" "$A_HC"
-    A_OK=true
 fi
 
-# ---- AAAA record ----
 if [[ "$DO_IPV6" = true ]]; then
-    AAAA_ATTEMPTED=true
     if [[ "$AAAA_SOURCE" == interface:* ]]; then
-        published=$(get_records_checked AAAA)
-        { read -r _; read -r published_ip; } < <(parse_record "$published")
+        { read -r _; read -r published_ip; } < <(parse_record "$AAAA_RESPONSE")
         IPV6=$(select_interface_ipv6 "${AAAA_SOURCE#interface:}" "$published_ip")
         if ! verify_interface_ip -6 "$IPV6"; then
             if [[ -n "$published_ip" && "$IPV6" == "$published_ip" ]]; then
@@ -772,56 +808,33 @@ if [[ "$DO_IPV6" = true ]]; then
         exit 1
     fi
     qprint "Current IPv6 is $IPV6"
-    sync_host_record AAAA "$IPV6" "$AAAA_HC"
-    AAAA_OK=true
 fi
 
-# ---- HTTPS record ----
+# ---- calculate the complete batch without mutating Cloudflare ----
+if [[ "$DO_IPV4" = true ]]; then plan_host_record A "$IPV4" "$A_RESPONSE"; fi
+if [[ "$DO_IPV6" = true ]]; then plan_host_record AAAA "$IPV6" "$AAAA_RESPONSE"; fi
 if [[ "$DO_HTTPS" = true ]]; then
-    https_resp=$(get_records_checked HTTPS)
+    plan_https_record "$IPV4" "$IPV6" "$HTTPS_RESPONSE"
+fi
 
-    https_pages=$(record_result_pages "$https_resp")
-    if (( https_pages > 1 )); then
-        err "Found more than one page of HTTPS records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
-        exit 1
-    fi
+# ---- apply all planned changes as one database transaction ----
+patch_count=$(jq 'length' <<<"$PATCHES_JSON")
+post_count=$(jq 'length' <<<"$POSTS_JSON")
+if (( patch_count > 0 || post_count > 0 )); then
+    submit_dns_batch
+    for line in "${PLANNED_OUTPUT[@]}"; do
+        printf '%s%s%s\n' "$C_PURPLE" "$line" "$C_RESET"
+    done
+    NOTIFY_LINES+=("${PLANNED_NOTIFY[@]}")
+fi
 
-    https_count=$(record_count "$https_resp")
-    if (( https_count > 1 )); then
-        err "Found $https_count HTTPS records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
-        exit 1
-    fi
-
-    { read -r cf_https_id
-      read -r cf_https_value
-      read -r cf_https_priority
-      read -r cf_https_target
-      read -r cf_https_ttl
-    } < <(parse_https_record "$https_resp")
-    cf_ipv4hint=$(svcparam_get "$cf_https_value" ipv4hint) || cf_ipv4hint=""
-    cf_ipv6hint=$(svcparam_get "$cf_https_value" ipv6hint) || cf_ipv6hint=""
-
-    # If a family wasn't refreshed in this run (e.g. -4-only), preserve the
-    # existing hint from Cloudflare so we don't silently drop it.
-    [[ "$DO_IPV4" = false ]] && IPV4="$cf_ipv4hint"
-    [[ "$DO_IPV6" = false ]] && IPV6="$cf_ipv6hint"
-
-    new_value=$(https_value "$IPV4" "$IPV6" "$cf_https_value")
-
-    if [[ -z "$cf_https_id" ]]; then
-        create_https_record "$new_value"
-        printf '%sCreated new HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
-        NOTIFY_LINES+=("Created HTTPS record for $RECORD")
-    elif [[ "$cf_ipv4hint" != "$IPV4" || "$cf_ipv6hint" != "$IPV6" ]]; then
-        update_https_record "$cf_https_id" "$new_value" "$cf_https_priority" "$cf_https_target"
-        printf '%sUpdated HTTPS record for %s%s\n' "$C_PURPLE" "$RECORD" "$C_RESET"
-        NOTIFY_LINES+=("Updated HTTPS record for $RECORD (ipv4hint=$IPV4 ipv6hint=$IPV6)")
-    elif [[ "$cf_https_ttl" != "$TTL" ]]; then
-        update_https_record "$cf_https_id" "$new_value" "$cf_https_priority" "$cf_https_target"
-        printf '%sUpdated TTL of HTTPS record for %s from %s to %s%s\n' \
-            "$C_PURPLE" "$RECORD" "$cf_https_ttl" "$TTL" "$C_RESET"
-        NOTIFY_LINES+=("Updated TTL of HTTPS record for $RECORD: $cf_https_ttl -> $TTL")
-    else
-        qprint "${C_YELLOW}No change to HTTPS record for $RECORD${C_RESET}"
-    fi
+# Changed families become successful only after the batch succeeds. Unchanged
+# families are successful once discovery, query, validation, and planning pass.
+if [[ "$DO_IPV4" = true ]]; then
+    A_OK=true
+    ping_hc "$A_HC"
+fi
+if [[ "$DO_IPV6" = true ]]; then
+    AAAA_OK=true
+    ping_hc "$AAAA_HC"
 fi
