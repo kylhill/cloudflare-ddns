@@ -28,7 +28,7 @@ IPV4=""
 IPV6=""
 A_STATUS=disabled
 AAAA_STATUS=disabled
-USER_AGENT="cloudflare-ddns/2.3"
+USER_AGENT="cloudflare-ddns/2.4"
 
 CF_API="https://api.cloudflare.com/client/v4"
 CF_AUTH_CONFIG=""
@@ -127,9 +127,61 @@ valid_ipv4() {
     local ip="$1" octet
     [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
     for octet in "${BASH_REMATCH[@]:1}"; do
-        (( octet <= 255 )) || return 1
+        [[ "$octet" == 0 || "$octet" != 0* ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
     done
     return 0
+}
+
+canonical_ipv6() {
+    local ip="${1,,}" ipv4_part prefix a b c d group part
+    local head tail missing i out=""
+    local -a head_parts=() tail_parts=() parts=()
+    valid_ipv6 "$ip" || return 1
+    if [[ "$ip" == *.* ]]; then
+        ipv4_part="${ip##*:}"
+        prefix="${ip%:*}"
+        IFS=. read -r a b c d <<<"$ipv4_part"
+        printf -v group '%x' "$((10#$a * 256 + 10#$b))"
+        ip="$prefix:$group"
+        printf -v group '%x' "$((10#$c * 256 + 10#$d))"
+        ip+="${ip:+:}$group"
+    fi
+    if [[ "$ip" == *::* ]]; then
+        head="${ip%%::*}"; tail="${ip#*::}"
+        [[ -n "$head" ]] && IFS=: read -r -a head_parts <<<"$head"
+        [[ -n "$tail" ]] && IFS=: read -r -a tail_parts <<<"$tail"
+        missing=$((8 - ${#head_parts[@]} - ${#tail_parts[@]}))
+        parts=("${head_parts[@]}")
+        for (( i = 0; i < missing; i++ )); do parts+=(0); done
+        parts+=("${tail_parts[@]}")
+    else
+        IFS=: read -r -a parts <<<"$ip"
+    fi
+    for part in "${parts[@]}"; do
+        printf -v group '%04x' "$((16#$part))"
+        out+="${out:+:}$group"
+    done
+    printf '%s' "$out"
+}
+
+addresses_equal() {
+    local family="$1" left="$2" right="$3" left_normal right_normal
+    case "$family" in
+        -4) [[ "$left" == "$right" ]] ;;
+        -6)
+            left_normal=$(canonical_ipv6 "$left") || return 1
+            right_normal=$(canonical_ipv6 "$right") || return 1
+            [[ "$left_normal" == "$right_normal" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+address_value_changed() {
+    local family="$1" old="$2" new="$3"
+    [[ -z "$old" && -z "$new" ]] && return 1
+    ! addresses_equal "$family" "$old" "$new"
 }
 
 valid_ipv6() {
@@ -185,7 +237,7 @@ query_external_ip() {
     local family="$1" source_ip="${2:-}" url ip last_err=""
     local -a bind_args=()
     case "$family" in -4|-6) ;; *) err "query_external_ip: must specify -4 or -6"; return 1;; esac
-    [[ -n "$source_ip" ]] && bind_args=(--interface "$source_ip")
+    [[ -n "$source_ip" ]] && bind_args=(--interface "host!$source_ip")
 
     for url in \
         "https://api.cloudflare.com/cdn-cgi/trace" \
@@ -218,7 +270,7 @@ query_external_ip() {
 verify_interface_ip() {
     local family="$1" selected="$2" observed
     observed=$(query_external_ip "$family" "$selected") || return 1
-    if [[ "$observed" != "$selected" ]]; then
+    if ! addresses_equal "$family" "$observed" "$selected"; then
         err "Interface address $selected does not match externally observed address $observed ($family)"
         return 1
     fi
@@ -228,6 +280,7 @@ public_ipv4() {
     local ip="$1" a b c
     valid_ipv4 "$ip" || return 1
     IFS=. read -r a b c _ <<<"$ip"
+    a=$((10#$a)); b=$((10#$b)); c=$((10#$c))
     (( a != 0 && a != 10 && a != 127 && a < 224 )) || return 1
     (( !(a == 100 && b >= 64 && b <= 127) )) || return 1
     (( !(a == 169 && b == 254) && !(a == 172 && b >= 16 && b <= 31) )) || return 1
@@ -263,7 +316,10 @@ select_interface_ipv6() {
     ((${#addresses[@]} > 0)) || { err "No stable public global IPv6 address found on interface $iface"; return 1; }
     local i best=-1 best_lft=-1 numeric ties=0
     for i in "${!addresses[@]}"; do
-        [[ -n "$published" && "${addresses[i]}" == "$published" ]] && { printf '%s' "$published"; return 0; }
+        if [[ -n "$published" ]] && addresses_equal -6 "${addresses[i]}" "$published"; then
+            printf '%s' "${addresses[i]}"
+            return 0
+        fi
         [[ "${lifetimes[i]}" == "forever" ]] && numeric=2147483647 || numeric=${lifetimes[i]%%sec*}
         [[ "$numeric" =~ ^[0-9]+$ ]] || numeric=0
         if (( numeric > best_lft )); then best=$i; best_lft=$numeric; ties=1
@@ -334,6 +390,22 @@ create_curl_auth_config() {
     chmod 600 "$CF_AUTH_CONFIG"
 }
 
+validate_credentials() {
+    if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ZONE_ID" ]]; then
+        err "Error: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID must be defined."
+        return 1
+    fi
+    if [[ "$CLOUDFLARE_API_TOKEN" == *$'\n'* || "$CLOUDFLARE_API_TOKEN" == *$'\r'* ||
+          "$CLOUDFLARE_API_TOKEN" == *'"'* || "$CLOUDFLARE_API_TOKEN" == *\\* ]]; then
+        err "Error: CLOUDFLARE_API_TOKEN contains characters unsafe for curl configuration."
+        return 1
+    fi
+    if [[ ! "$CLOUDFLARE_ZONE_ID" =~ ^[0-9A-Fa-f]{32}$ ]]; then
+        err "Error: CLOUDFLARE_ZONE_ID must be a 32-character hexadecimal identifier."
+        return 1
+    fi
+}
+
 get_records_checked() {
     local type="$1" body pages count
     body=$(cf_api_get "/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
@@ -342,7 +414,7 @@ get_records_checked() {
         [[ -n "$body" ]] && printf '%s\n' "$body" >&2
         return 1
     }
-    check_success "$body" "list $type records"
+    check_success "$body" "list $type records" || return 1
     { read -r pages; read -r count; } < <(
         jq -r '[.result_info.total_pages // 1, (.result | length)] | .[]' <<<"$body"
     )
@@ -395,8 +467,12 @@ append_plan_operation() {
 
 plan_host_record() {
     local type="$1" ip="$2" response="$3"
-    local cf_id cf_ip cf_proxied cf_ttl data message output
+    local cf_id cf_ip cf_proxied cf_ttl data message output family content_changed=false
     { read -r cf_id; read -r cf_ip; read -r cf_proxied; read -r cf_ttl; } < <(parse_record "$response")
+    [[ "$type" == A ]] && family=-4 || family=-6
+    if [[ -n "$cf_id" ]] && ! addresses_equal "$family" "$ip" "$cf_ip"; then
+        content_changed=true
+    fi
 
     if [[ -z "$cf_id" ]]; then
         data=$(jq -nc --arg type "$type" --arg name "$RECORD" --arg ip "$ip" \
@@ -404,12 +480,12 @@ plan_host_record() {
         output="Created new $type record for $RECORD, $ip"
         message="Created $type record for $RECORD: $ip"
         append_plan_operation posts "$data" "$output" "$message" "$type"
-    elif [[ "$ip" != "$cf_ip" || "$cf_ttl" != "$TTL" || "$cf_proxied" != false ]]; then
+    elif [[ "$content_changed" == true || "$cf_ttl" != "$TTL" || "$cf_proxied" != false ]]; then
         data=$(jq -nc --arg id "$cf_id" '{id:$id}')
-        [[ "$ip" != "$cf_ip" ]] && data=$(jq -c --arg value "$ip" '.content=$value' <<<"$data")
+        [[ "$content_changed" == true ]] && data=$(jq -c --arg value "$ip" '.content=$value' <<<"$data")
         [[ "$cf_ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
         [[ "$cf_proxied" != false ]] && data=$(jq -c '.proxied=false' <<<"$data")
-        if [[ "$ip" != "$cf_ip" ]]; then
+        if [[ "$content_changed" == true ]]; then
             output="Updated $type record for $RECORD from $cf_ip to $ip"
             message="Updated $type record for $RECORD: $cf_ip -> $ip"
         elif [[ "$cf_ttl" != "$TTL" ]]; then
@@ -431,9 +507,13 @@ plan_host_record() {
 # by the rebuilt value, one field per line.
 transform_https_hints() {
     local value="${1:-}" ipv4="$2" ipv6="$3" token="" ch key item token_value out=""
-    local old4="" old6="" in_quote=0 i
+    local old4="" old6="" in_quote=0 ipv4_count=0 ipv6_count=0 i
     local -a tokens=()
     [[ -z "$value" ]] && value='alpn="h3,h2"'
+    if [[ "$value" == *\\* ]]; then
+        err "HTTPS SvcParams contain escape sequences that cannot be preserved safely; refusing to update"
+        return 1
+    fi
     for (( i = 0; i < ${#value}; i++ )); do
         ch="${value:i:1}"
         if [[ "$ch" == '"' ]]; then
@@ -446,6 +526,10 @@ transform_https_hints() {
             token+="$ch"
         fi
     done
+    if (( in_quote != 0 )); then
+        err "HTTPS SvcParams contain an unterminated quoted value; refusing to update"
+        return 1
+    fi
     [[ -n "$token" ]] && tokens+=("$token")
 
     for item in "${tokens[@]}"; do
@@ -457,11 +541,19 @@ transform_https_hints() {
                     token_value="${token_value#\"}"
                     token_value="${token_value%\"}"
                 fi
-                [[ "$key" == ipv4hint ]] && old4="$token_value" || old6="$token_value"
+                if [[ "$key" == ipv4hint ]]; then
+                    ((ipv4_count+=1)); old4="$token_value"
+                else
+                    ((ipv6_count+=1)); old6="$token_value"
+                fi
                 ;;
             *) out+="${out:+ }$item" ;;
         esac
     done
+    if (( ipv4_count > 1 || ipv6_count > 1 )); then
+        err "HTTPS SvcParams contain duplicate address hints; refusing to update"
+        return 1
+    fi
     [[ "$DO_IPV4" = false ]] && ipv4="$old4"
     [[ "$DO_IPV6" = false ]] && ipv6="$old6"
     [[ -n "$ipv4" ]] && out+="${out:+ }ipv4hint=\"$ipv4\""
@@ -471,10 +563,13 @@ transform_https_hints() {
 
 plan_https_record() {
     local ipv4="$1" ipv6="$2" response="$3"
-    local id value priority target ttl old4 old6 new_value data output message
+    local id value priority target ttl old4 old6 new_value data output message transformed
+    local ipv4_changed=false ipv6_changed=false
     { read -r id; read -r value; read -r priority; read -r target; read -r ttl; } < <(parse_https_record "$response")
-    { read -r old4; read -r old6; read -r ipv4; read -r ipv6; read -r new_value; } \
-        < <(transform_https_hints "$value" "$ipv4" "$ipv6")
+    transformed=$(transform_https_hints "$value" "$ipv4" "$ipv6") || return 1
+    { read -r old4; read -r old6; read -r ipv4; read -r ipv6; read -r new_value; } <<<"$transformed"
+    address_value_changed -4 "$old4" "$ipv4" && ipv4_changed=true
+    address_value_changed -6 "$old6" "$ipv6" && ipv6_changed=true
 
     if [[ -z "$id" ]]; then
         # HTTPS records must not include proxied; Cloudflare rejects that field.
@@ -484,9 +579,9 @@ plan_https_record() {
         output="Created new HTTPS record for $RECORD"
         message="Created HTTPS record for $RECORD"
         append_plan_operation posts "$data" "$output" "$message" HTTPS
-    elif [[ "$old4" != "$ipv4" || "$old6" != "$ipv6" || "$ttl" != "$TTL" ]]; then
+    elif [[ "$ipv4_changed" == true || "$ipv6_changed" == true || "$ttl" != "$TTL" ]]; then
         data=$(jq -nc --arg id "$id" '{id:$id}')
-        if [[ "$old4" != "$ipv4" || "$old6" != "$ipv6" ]]; then
+        if [[ "$ipv4_changed" == true || "$ipv6_changed" == true ]]; then
             data=$(jq -c --arg value "$new_value" --arg target "$target" --argjson priority "$priority" \
                 '.data={priority:$priority,target:$target,value:$value}' <<<"$data")
         fi
@@ -501,9 +596,10 @@ plan_https_record() {
 }
 
 ping_hc() {
-    local url="$1"
+    local family="$1" url="$2"
     [[ -z "$url" ]] && return 0
-    "${CURL_GET[@]}" -o /dev/null "$url" || err "Healthcheck ping to $url failed"
+    # Monitoring delivery is best-effort after DNS reconciliation succeeds.
+    "${CURL_GET[@]}" -o /dev/null "$url" || err "$family healthcheck ping failed"
 }
 
 submit_dns_batch() {
@@ -517,7 +613,7 @@ submit_dns_batch() {
         [[ -n "$body" ]] && printf '%s\n' "$body" >&2
         return 1
     fi
-    check_success "$body" "DNS batch update"
+    check_success "$body" "DNS batch update" || return 1
     { read -r error_count; read -r actual_patches; read -r actual_posts; } < <(
         jq -r '[(.errors // [] | length), (.result.patches // [] | length),
                 (.result.posts // [] | length)] | .[]' <<<"$body"
@@ -616,10 +712,7 @@ if [[ "$A_SOURCE" == interface:* || "$AAAA_SOURCE" == interface:* ]]; then
     require_cmd ip
 fi
 
-if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ZONE_ID" ]]; then
-    err "Error: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ZONE_ID must be defined."
-    exit 1
-fi
+validate_credentials
 
 if ! [[ "$TTL" =~ ^[0-9]+$ ]] || ! { [[ "$TTL" == "1" ]] || (( TTL >= 60 && TTL <= 86400 )); }; then
     err "TTL must be 1 (auto) or an integer between 60 and 86400"
@@ -682,7 +775,7 @@ if [[ "$DO_IPV6" = true ]]; then
         { read -r _; read -r published_ip; } < <(parse_record "$AAAA_RESPONSE")
         IPV6=$(select_interface_ipv6 "${AAAA_SOURCE#interface:}" "$published_ip")
         if ! verify_interface_ip -6 "$IPV6"; then
-            if [[ -n "$published_ip" && "$IPV6" == "$published_ip" ]]; then
+            if [[ -n "$published_ip" ]] && addresses_equal -6 "$IPV6" "$published_ip"; then
                 err "Published IPv6 address is no longer externally usable; trying the longest-lived preferred alternative"
                 IPV6=$(select_interface_ipv6 "${AAAA_SOURCE#interface:}" "" "$published_ip")
                 verify_interface_ip -6 "$IPV6"
@@ -721,9 +814,9 @@ fi
 # families are successful once discovery, query, validation, and planning pass.
 if [[ "$DO_IPV4" = true ]]; then
     A_STATUS=successful
-    ping_hc "$A_HC"
+    ping_hc A "$A_HC"
 fi
 if [[ "$DO_IPV6" = true ]]; then
     AAAA_STATUS=successful
-    ping_hc "$AAAA_HC"
+    ping_hc AAAA "$AAAA_HC"
 fi

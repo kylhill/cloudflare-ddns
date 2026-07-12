@@ -30,6 +30,10 @@ Options:
 variables or as systemd credentials named `cloudflare_api_token` and
 `cloudflare_zone_id`.
 
+The zone ID must be its 32-character hexadecimal Cloudflare identifier. API
+tokens and credential files must contain a single token value without embedded
+newlines or curl-config quoting characters.
+
 Both address-source variables default to `external`. Interface mode selects a
 public address from the named interface and verifies it with a source-bound
 external request before changing DNS. For example:

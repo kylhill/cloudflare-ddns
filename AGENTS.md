@@ -35,6 +35,9 @@ The harness covers:
 - interface-derived IPv6 filtering
 - HTTPS SvcParams, priority, and target preservation while refreshing address hints
 - mixed batch POST/PATCH operations, no-op runs, batch failures, and partial-family hint preservation
+- HTTP-200 API error envelopes, malformed JSON, and inconsistent batch responses
+- canonical IPv6 comparison and deterministic interface address selection
+- credential validation, auth-file permissions/cleanup, failure mail, and healthcheck URL redaction
 
 ## Architecture
 
