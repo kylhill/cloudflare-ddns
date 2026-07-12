@@ -248,11 +248,6 @@ if [[ "$method" == POST && "$url" == */dns_records/batch ]]; then
     exit 0
 fi
 
-if [[ "$method" == POST || "$method" == PATCH || "$method" == PUT ]]; then
-    printf '{"success":true,"result":{"id":"mutated"}}\n'
-    exit 0
-fi
-
 printf 'unhandled curl fixture: %s\n' "$raw" >&2
 exit 65
 EOF

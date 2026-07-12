@@ -48,8 +48,8 @@ CURL_BASE=(
 )
 # Read-only / idempotent requests can retry liberally
 CURL_GET=("${CURL_BASE[@]}" --retry 5 --retry-delay 2 --retry-max-time 30 --retry-all-errors)
-# POSTs (record creation) are NOT idempotent: a transient error on a
-# request that actually reached Cloudflare could create a duplicate on retry.
+# The DNS batch POST is not retried because a lost response leaves its outcome
+# ambiguous even though the database operation may have completed.
 CURL_POST=("${CURL_BASE[@]}")
 # IP detection: tight timeout, single retry; we already iterate fallbacks
 CURL_IP=(
@@ -335,31 +335,26 @@ create_curl_auth_config() {
 }
 
 get_records_checked() {
-    local type="$1" body
-    body=$(get_records "$type") || {
+    local type="$1" body pages count
+    body=$(cf_api_get "/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+        "type=$type" "name.exact=$RECORD" "page=1" "per_page=100") || {
         err "Cloudflare API request failed while listing $type records:"
         [[ -n "$body" ]] && printf '%s\n' "$body" >&2
         return 1
     }
     check_success "$body" "list $type records"
-    validate_single_record "$type" "$body" || return 1
+    { read -r pages; read -r count; } < <(
+        jq -r '[.result_info.total_pages // 1, (.result | length)] | .[]' <<<"$body"
+    )
+    if (( pages > 1 )); then
+        err "Found more than one page of $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+        return 1
+    fi
+    if (( count > 1 )); then
+        err "Found $count $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
+        return 1
+    fi
     printf '%s' "$body"
-}
-
-# Get all records matching type + name (up to 100).
-get_records() {
-    cf_api_get "/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
-        "type=$1" "name.exact=$RECORD" "page=1" "per_page=100"
-}
-
-# Refuse to proceed if more than one record matches; safer than silently
-# updating only the first.
-record_count() {
-    jq -r '.result | length' <<<"$1"
-}
-
-record_result_pages() {
-    jq -r '.result_info.total_pages // 1' <<<"$1"
 }
 
 # Parse id + content + proxied + ttl from result[0]. Outputs four lines.
@@ -389,17 +384,6 @@ parse_https_record() {
     ' <<<"$1"
 }
 
-svcparam_token_value() {
-    local token="$1" token_value
-    [[ "$token" == *=* ]] || return 1
-    token_value="${token#*=}"
-    if [[ "$token_value" == \"*\" && "$token_value" == *\" ]]; then
-        token_value="${token_value#\"}"
-        token_value="${token_value%\"}"
-    fi
-    printf '%s' "$token_value"
-}
-
 append_plan_operation() {
     local collection="$1" operation="$2" output="$3" notification="$4" family="$5"
     PLAN_JSON=$(jq -c \
@@ -407,20 +391,6 @@ append_plan_operation() {
         --arg output "$output" --arg notification "$notification" --arg family "$family" \
         '.[$collection] += [$operation] |
          .messages += [{console:$output, notification:$notification, family:$family}]' <<<"$PLAN_JSON")
-}
-
-validate_single_record() {
-    local type="$1" response="$2" pages count
-    pages=$(record_result_pages "$response")
-    if (( pages > 1 )); then
-        err "Found more than one page of $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
-        return 1
-    fi
-    count=$(record_count "$response")
-    if (( count > 1 )); then
-        err "Found $count $type records for $RECORD; refusing to update. Remove duplicates in the Cloudflare dashboard."
-        return 1
-    fi
 }
 
 plan_host_record() {
@@ -457,10 +427,10 @@ plan_host_record() {
 }
 
 # Parse the SvcParams once, extract both existing hints, and rebuild the value
-# while preserving all unrelated tokens. Outputs old IPv4 hint, old IPv6 hint,
-# and the desired value on separate lines.
+# while preserving all unrelated tokens. Outputs old and desired hints followed
+# by the rebuilt value, one field per line.
 transform_https_hints() {
-    local value="${1:-}" ipv4="$2" ipv6="$3" token="" ch key item out=""
+    local value="${1:-}" ipv4="$2" ipv6="$3" token="" ch key item token_value out=""
     local old4="" old6="" in_quote=0 i
     local -a tokens=()
     [[ -z "$value" ]] && value='alpn="h3,h2"'
@@ -481,8 +451,14 @@ transform_https_hints() {
     for item in "${tokens[@]}"; do
         key="${item%%=*}"
         case "$key" in
-            ipv4hint) old4=$(svcparam_token_value "$item") || old4="" ;;
-            ipv6hint) old6=$(svcparam_token_value "$item") || old6="" ;;
+            ipv4hint|ipv6hint)
+                token_value="${item#*=}"
+                if [[ "$token_value" == \"*\" && "$token_value" == *\" ]]; then
+                    token_value="${token_value#\"}"
+                    token_value="${token_value%\"}"
+                fi
+                [[ "$key" == ipv4hint ]] && old4="$token_value" || old6="$token_value"
+                ;;
             *) out+="${out:+ }$item" ;;
         esac
     done
@@ -490,30 +466,21 @@ transform_https_hints() {
     [[ "$DO_IPV6" = false ]] && ipv6="$old6"
     [[ -n "$ipv4" ]] && out+="${out:+ }ipv4hint=\"$ipv4\""
     [[ -n "$ipv6" ]] && out+="${out:+ }ipv6hint=\"$ipv6\""
-    printf '%s\n%s\n%s\n' "$old4" "$old6" "$out"
-}
-
-https_record_data() {
-    local value="$1" priority="${2:-1}" target="${3:-.}"
-    # NOTE: HTTPS records do not accept a `proxied` field; sending it makes
-    # the Cloudflare API reject the create/update request.
-    jq -nc \
-        --arg name "$RECORD" --arg value "$value" --arg target "$target" \
-        --argjson ttl "$TTL" --argjson priority "$priority" \
-        '{type:"HTTPS", name:$name, ttl:$ttl,
-          data:{priority:$priority, target:$target, value:$value}}'
+    printf '%s\n%s\n%s\n%s\n%s\n' "$old4" "$old6" "$ipv4" "$ipv6" "$out"
 }
 
 plan_https_record() {
     local ipv4="$1" ipv6="$2" response="$3"
     local id value priority target ttl old4 old6 new_value data output message
     { read -r id; read -r value; read -r priority; read -r target; read -r ttl; } < <(parse_https_record "$response")
-    { read -r old4; read -r old6; read -r new_value; } < <(transform_https_hints "$value" "$ipv4" "$ipv6")
-    [[ "$DO_IPV4" = false ]] && ipv4="$old4"
-    [[ "$DO_IPV6" = false ]] && ipv6="$old6"
+    { read -r old4; read -r old6; read -r ipv4; read -r ipv6; read -r new_value; } \
+        < <(transform_https_hints "$value" "$ipv4" "$ipv6")
 
     if [[ -z "$id" ]]; then
-        data=$(https_record_data "$new_value")
+        # HTTPS records must not include proxied; Cloudflare rejects that field.
+        data=$(jq -nc --arg name "$RECORD" --arg value "$new_value" --argjson ttl "$TTL" \
+            '{type:"HTTPS", name:$name, ttl:$ttl,
+              data:{priority:1, target:".", value:$value}}')
         output="Created new HTTPS record for $RECORD"
         message="Created HTTPS record for $RECORD"
         append_plan_operation posts "$data" "$output" "$message" HTTPS
@@ -540,9 +507,10 @@ ping_hc() {
 }
 
 submit_dns_batch() {
-    local batch body expected_patches expected_posts actual_patches actual_posts
-    expected_patches=$(jq '.patches | length' <<<"$PLAN_JSON")
-    expected_posts=$(jq '.posts | length' <<<"$PLAN_JSON")
+    local batch body expected_patches expected_posts error_count actual_patches actual_posts
+    { read -r expected_patches; read -r expected_posts; } < <(
+        jq -r '[(.patches | length), (.posts | length)] | .[]' <<<"$PLAN_JSON"
+    )
     batch=$(jq -c '{patches, posts} | with_entries(select(.value | length > 0))' <<<"$PLAN_JSON")
     if ! body=$(cf_api_batch "$batch"); then
         err "Cloudflare DNS batch request failed; its outcome may be ambiguous. Check Cloudflare state before retrying."
@@ -550,13 +518,15 @@ submit_dns_batch() {
         return 1
     fi
     check_success "$body" "DNS batch update"
-    if ! jq -e '((.errors // []) | length) == 0' <<<"$body" >/dev/null; then
+    { read -r error_count; read -r actual_patches; read -r actual_posts; } < <(
+        jq -r '[(.errors // [] | length), (.result.patches // [] | length),
+                (.result.posts // [] | length)] | .[]' <<<"$body"
+    )
+    if (( error_count > 0 )); then
         err "Cloudflare DNS batch response contained operation errors:"
         jq -r '.errors[]? | "  [\(.code)] \(.message)"' <<<"$body" >&2
         return 1
     fi
-    actual_patches=$(jq -r '.result.patches // [] | length' <<<"$body")
-    actual_posts=$(jq -r '.result.posts // [] | length' <<<"$body")
     if (( actual_patches != expected_patches || actual_posts != expected_posts )); then
         err "Cloudflare DNS batch response did not account for every planned operation"
         return 1
@@ -738,9 +708,7 @@ if [[ "$DO_HTTPS" = true ]]; then
 fi
 
 # ---- apply all planned changes as one database transaction ----
-patch_count=$(jq '.patches | length' <<<"$PLAN_JSON")
-post_count=$(jq '.posts | length' <<<"$PLAN_JSON")
-if (( patch_count > 0 || post_count > 0 )); then
+if jq -e '((.patches | length) + (.posts | length)) > 0' <<<"$PLAN_JSON" >/dev/null; then
     submit_dns_batch
     mapfile -t completed_output < <(jq -r '.messages[].console' <<<"$PLAN_JSON")
     for line in "${completed_output[@]}"; do
