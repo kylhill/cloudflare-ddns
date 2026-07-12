@@ -8,7 +8,8 @@ Single-file Bash script (`cloudflare-ddns.sh`) that updates Cloudflare DNS `A`, 
 
 Runtime: `bash`, `curl`, `jq`, `flock`, `awk`, `tr`. Optional: `sendmail`.
 
-`ip` is required only when `CLOUDFLARE_DDNS_AAAA_IFACE` is set.
+`ip` is required only when `CLOUDFLARE_DDNS_A_SOURCE` or
+`CLOUDFLARE_DDNS_AAAA_SOURCE` uses `interface:<name>`.
 
 No build step or package manager.
 

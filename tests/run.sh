@@ -22,6 +22,7 @@ set -euo pipefail
 
 method=GET
 family=""
+source_ip=""
 data=""
 type=""
 name_exact=""
@@ -55,6 +56,10 @@ while (($#)); do
         -4|-6)
             family="$1"
             shift
+            ;;
+        --interface)
+            source_ip="$2"
+            shift 2
             ;;
         http://*|https://*)
             url="$1"
@@ -93,6 +98,10 @@ if [[ "$url" == */user/tokens/verify ]]; then
 fi
 
 if [[ "$url" == *cdn-cgi/trace ]]; then
+    if [[ -n "$source_ip" ]]; then
+        printf 'ip=%s\n' "$source_ip"
+        exit 0
+    fi
     if [[ "${TEST_SCENARIO:-}" == invalid_provider_fallback ]]; then
         case "$family" in
             -4) printf '<html>not an ip</html>\n' ;;
@@ -150,6 +159,9 @@ if [[ "$method" == GET && "$url" == */dns_records ]]; then
         ipv6_iface)
             records_response 1 "[$(json_record AAAA1 2001:db8::42 false 3600)]"
             ;;
+        ipv4_iface)
+            records_response 1 "[$(json_record A1 8.8.4.4 false 3600)]"
+            ;;
         invalid_provider_fallback)
             if [[ "$type" == A ]]; then
                 records_response 1 "[$(json_record A1 198.51.100.43 false 3600)]"
@@ -190,15 +202,11 @@ cat >"$MOCKBIN/ip" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"$TEST_IP_LOG"
-cat <<'IPADDR'
-2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 state UP
-    inet6 2001:db8::dead/64 scope global temporary dynamic
-   valid_lft 3600sec preferred_lft 1800sec
-    inet6 2001:db8::bad/64 scope global deprecated dynamic
-   valid_lft 3600sec preferred_lft 0sec
-    inet6 2001:db8::42/64 scope global dynamic
-   valid_lft 3600sec preferred_lft 1800sec
-IPADDR
+if [[ "$*" == *" -4 "* || "$1" == "-j" && "$2" == "-4" ]]; then
+    printf '[{"addr_info":[{"family":"inet","local":"8.8.4.4","scope":"global","flags":[]}]}]\n'
+else
+    printf '[{"addr_info":[{"family":"inet6","local":"2001:db8::dead","scope":"global","flags":["temporary"],"preferred_life_time":3600},{"family":"inet6","local":"2001:db8::bad","scope":"global","flags":["deprecated"],"preferred_life_time":7200},{"family":"inet6","local":"2001:db8::42","scope":"global","flags":[],"preferred_life_time":1800}]}]\n'
+fi
 EOF
 
 cat >"$MOCKBIN/sendmail" <<'EOF'
@@ -236,9 +244,10 @@ run_script() {
     local scenario="$1" output="$2"
     shift 2
     local runtime_dir="$TEST_TMP/runtime-$scenario"
-    local ipv6_iface=""
+    local ipv6_iface="" ipv4_iface=""
     mkdir -p "$runtime_dir"
     [[ "$scenario" == ipv6_iface ]] && ipv6_iface="eth0"
+    [[ "$scenario" == ipv4_iface ]] && ipv4_iface="wan"
     PATH="$MOCKBIN:$PATH" \
     TEST_SCENARIO="$scenario" \
     TEST_CURL_LOG="$CURL_LOG" \
@@ -246,7 +255,8 @@ run_script() {
     TEST_SENDMAIL_LOG="$SENDMAIL_LOG" \
     CLOUDFLARE_API_TOKEN="test-token" \
     CLOUDFLARE_ZONE_ID="test-zone" \
-    CLOUDFLARE_DDNS_AAAA_IFACE="$ipv6_iface" \
+    CLOUDFLARE_DDNS_A_SOURCE="${ipv4_iface:+interface:$ipv4_iface}" \
+    CLOUDFLARE_DDNS_AAAA_SOURCE="${ipv6_iface:+interface:$ipv6_iface}" \
     RUNTIME_DIRECTORY="$runtime_dir" \
         "$SCRIPT" "$@" >"$output" 2>&1
 }
@@ -264,7 +274,8 @@ run_script_with_systemd_credentials() {
     TEST_CURL_LOG="$CURL_LOG" \
     TEST_IP_LOG="$IP_LOG" \
     TEST_SENDMAIL_LOG="$SENDMAIL_LOG" \
-    CLOUDFLARE_DDNS_AAAA_IFACE="" \
+    CLOUDFLARE_DDNS_A_SOURCE="external" \
+    CLOUDFLARE_DDNS_AAAA_SOURCE="external" \
     CREDENTIALS_DIRECTORY="$credentials_dir" \
     RUNTIME_DIRECTORY="$runtime_dir" \
         "$SCRIPT" "$@" >"$output" 2>&1
@@ -332,7 +343,8 @@ assert_not_contains "$CURL_LOG" "method=POST"
 expect_success "TTL 60 is accepted and patched" ttl60 -4 -t 60 example.com
 patch_line=$(grep 'method=PATCH' "$CURL_LOG")
 [[ "$patch_line" == *'"ttl":60'* ]] || fail "PATCH payload did not set ttl 60"
-[[ "$patch_line" == *'"proxied":true'* ]] || fail "PATCH payload did not preserve proxied"
+[[ "$patch_line" == *'"proxied":false'* ]] || fail "PATCH payload did not disable proxying"
+assert_not_contains "$CURL_LOG" '"content":"198.51.100.42"'
 
 expect_success "invalid provider output falls back" invalid_provider_fallback -4 example.com
 assert_contains "$TEST_TMP/invalid provider output falls back.out" "Current IPv4 is 198.51.100.43"
@@ -345,7 +357,11 @@ assert_contains "$CURL_LOG" "name_exact=example.com"
 
 expect_success "interface IPv6 skips unstable addresses" ipv6_iface -6 example.com
 assert_contains "$TEST_TMP/interface IPv6 skips unstable addresses.out" "Current IPv6 is 2001:db8::42"
-assert_contains "$IP_LOG" "-6 addr show dev eth0 scope global"
+assert_contains "$IP_LOG" "-j -6 addr show dev eth0"
+
+expect_success "interface IPv4 is selected and source-bound verified" ipv4_iface -4 example.com
+assert_contains "$TEST_TMP/interface IPv4 is selected and source-bound verified.out" "Current IPv4 is 8.8.4.4"
+assert_contains "$CURL_LOG" "--interface 8.8.4.4"
 
 expect_success "HTTPS update preserves unrelated SvcParams" https_preserve -4 -s example.com
 https_patch=$(grep 'method=PATCH' "$CURL_LOG" | tail -n 1)

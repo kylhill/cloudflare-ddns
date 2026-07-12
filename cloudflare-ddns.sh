@@ -34,6 +34,8 @@ USER_AGENT="cloudflare-ddns/2.3"
 
 CF_API="https://api.cloudflare.com/client/v4"
 CF_AUTH_CONFIG=""
+A_SOURCE=""
+AAAA_SOURCE=""
 
 # Curl base options
 #   --fail-with-body : print body on HTTP error before exit
@@ -47,7 +49,7 @@ CURL_BASE=(
     --max-time 15
 )
 # Read-only / idempotent requests can retry liberally
-CURL_GET=("${CURL_BASE[@]}" --retry 5 --retry-delay 2 --retry-max-time 30)
+CURL_GET=("${CURL_BASE[@]}" --retry 5 --retry-delay 2 --retry-max-time 30 --retry-all-errors)
 # POSTs (record creation) are NOT idempotent: a transient error on a
 # request that actually reached Cloudflare could create a duplicate on retry.
 CURL_POST=("${CURL_BASE[@]}")
@@ -210,6 +212,84 @@ get_ip() {
     return 1
 }
 
+observe_ip() {
+    local family="$1" source_ip="$2" url ip last_err=""
+    for url in "https://api.cloudflare.com/cdn-cgi/trace" "https://icanhazip.com" "https://ifconfig.co"; do
+        if ! ip=$("${CURL_IP[@]}" "$family" --interface "$source_ip" "$url" 2>&1); then
+            last_err="$ip"; continue
+        fi
+        if [[ "$url" == *cdn-cgi/trace* ]]; then
+            ip=$(awk -F= '/^ip=/ { print $2; exit }' <<<"$ip")
+        else
+            ip=$(printf '%s' "$ip" | tr -d '[:space:]')
+        fi
+        if valid_ip_for_family "$family" "$ip"; then
+            printf '%s' "$ip"; return 0
+        fi
+        last_err="invalid response from $url: $ip"
+    done
+    err "Failed to verify interface address $source_ip ($family). Last error: $last_err"
+    return 1
+}
+
+verify_interface_ip() {
+    local family="$1" selected="$2" observed
+    observed=$(observe_ip "$family" "$selected") || return 1
+    if [[ "$observed" != "$selected" ]]; then
+        err "Interface address $selected does not match externally observed address $observed ($family)"
+        return 1
+    fi
+}
+
+public_ipv4() {
+    local ip="$1" a b c
+    valid_ipv4 "$ip" || return 1
+    IFS=. read -r a b c _ <<<"$ip"
+    (( a != 0 && a != 10 && a != 127 && a < 224 )) || return 1
+    (( !(a == 100 && b >= 64 && b <= 127) )) || return 1
+    (( !(a == 169 && b == 254) && !(a == 172 && b >= 16 && b <= 31) )) || return 1
+    (( !(a == 192 && b == 168) && !(a == 192 && b == 0 && (c == 0 || c == 2)) )) || return 1
+    (( !(a == 198 && (b == 18 || b == 19 || b == 51 && c == 100)) )) || return 1
+    (( !(a == 203 && b == 0 && c == 113) )) || return 1
+    return 0
+}
+
+select_interface_ipv4() {
+    local iface="$1" json
+    local -a candidates
+    json=$(ip -j -4 addr show dev "$iface") || { err "Failed to read IPv4 addresses from interface $iface"; return 1; }
+    mapfile -t candidates < <(jq -r '.[]?.addr_info[]? | select(.family == "inet" and .scope == "global") | select(((.flags // []) | index("tentative") | not) and ((.flags // []) | index("dadfailed") | not) and ((.flags // []) | index("deprecated") | not)) | .local' <<<"$json")
+    local -a usable=(); local candidate
+    for candidate in "${candidates[@]}"; do public_ipv4 "$candidate" && usable+=("$candidate"); done
+    if ((${#usable[@]} != 1)); then
+        err "Expected exactly one stable public IPv4 address on interface $iface; found ${#usable[@]}"
+        return 1
+    fi
+    printf '%s' "${usable[0]}"
+}
+
+select_interface_ipv6() {
+    local iface="$1" published="${2:-}" excluded="${3:-}" json addr lifetime
+    local -a addresses=() lifetimes=()
+    json=$(ip -j -6 addr show dev "$iface") || { err "Failed to read IPv6 addresses from interface $iface"; return 1; }
+    while IFS=$'\t' read -r addr lifetime; do
+        [[ "$addr" =~ ^[23] ]] || continue
+        [[ -n "$excluded" && "$addr" == "$excluded" ]] && continue
+        addresses+=("$addr"); lifetimes+=("$lifetime")
+    done < <(jq -r '.[]?.addr_info[]? | select(.family == "inet6" and .scope == "global") | select(((.flags // []) | index("temporary") | not) and ((.flags // []) | index("tentative") | not) and ((.flags // []) | index("dadfailed") | not) and ((.flags // []) | index("deprecated") | not)) | [.local, (.preferred_life_time // 0 | tostring)] | @tsv' <<<"$json")
+    ((${#addresses[@]} > 0)) || { err "No stable public global IPv6 address found on interface $iface"; return 1; }
+    local i best=-1 best_lft=-1 numeric ties=0
+    for i in "${!addresses[@]}"; do
+        [[ -n "$published" && "${addresses[i]}" == "$published" ]] && { printf '%s' "$published"; return 0; }
+        [[ "${lifetimes[i]}" == "forever" ]] && numeric=2147483647 || numeric=${lifetimes[i]%%sec*}
+        [[ "$numeric" =~ ^[0-9]+$ ]] || numeric=0
+        if (( numeric > best_lft )); then best=$i; best_lft=$numeric; ties=1
+        elif (( numeric == best_lft )); then ((ties+=1)); fi
+    done
+    (( ties == 1 )) || { err "Multiple equally preferred public IPv6 addresses remain on interface $iface; refusing an ambiguous choice"; return 1; }
+    printf '%s' "${addresses[best]}"
+}
+
 # Verify a Cloudflare API JSON response has success:true; on failure, print errors and exit.
 check_success() {
     local body="$1" context="$2"
@@ -270,9 +350,10 @@ load_systemd_credentials() {
 }
 
 create_curl_auth_config() {
-    CF_AUTH_CONFIG="$STATE_DIR/cloudflare-auth.curl"
     umask 077
+    CF_AUTH_CONFIG=$(mktemp "$STATE_DIR/cloudflare-auth.XXXXXX")
     printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" >"$CF_AUTH_CONFIG"
+    chmod 600 "$CF_AUTH_CONFIG"
 }
 
 verify_token() {
@@ -389,13 +470,9 @@ create_host_record() {
 }
 
 update_host_record() {
-    local id="$1" type="$2" ip="$3" proxied="$4" data body
-    data=$(jq -nc \
-        --arg type "$type" --arg name "$RECORD" --arg ip "$ip" \
-        --argjson ttl "$TTL" --argjson proxied "$proxied" \
-        '{type:$type, name:$name, content:$ip, ttl:$ttl, proxied:$proxied}')
+    local id="$1" data="$2" body
     body=$(cf_api_mutate PATCH "/zones/$CLOUDFLARE_ZONE_ID/dns_records/$id" "$data") || true
-    check_success "$body" "update $type record"
+    check_success "$body" "update host record"
 }
 
 flush_svcparam_token() {
@@ -508,17 +585,24 @@ sync_host_record() {
         create_host_record "$type" "$ip" false
         printf '%sCreated new %s record for %s, %s%s\n' "$C_PURPLE" "$type" "$RECORD" "$ip" "$C_RESET"
         NOTIFY_LINES+=("Created $type record for $RECORD: $ip")
-    elif [[ "$ip" != "$cf_ip" ]]; then
-        # Preserve existing proxied state set in the dashboard
-        update_host_record "$cf_id" "$type" "$ip" "$cf_proxied"
+    elif [[ "$ip" != "$cf_ip" || "$cf_ttl" != "$TTL" || "$cf_proxied" != false ]]; then
+        local data='{}'
+        [[ "$ip" != "$cf_ip" ]] && data=$(jq -c --arg value "$ip" '.content=$value' <<<"$data")
+        [[ "$cf_ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
+        [[ "$cf_proxied" != false ]] && data=$(jq -c '.proxied=false' <<<"$data")
+        update_host_record "$cf_id" "$data"
+        if [[ "$ip" != "$cf_ip" ]]; then
         printf '%sUpdated %s record for %s from %s to %s%s\n' \
             "$C_PURPLE" "$type" "$RECORD" "$cf_ip" "$ip" "$C_RESET"
         NOTIFY_LINES+=("Updated $type record for $RECORD: $cf_ip -> $ip")
-    elif [[ "$cf_ttl" != "$TTL" ]]; then
-        update_host_record "$cf_id" "$type" "$ip" "$cf_proxied"
+        elif [[ "$cf_ttl" != "$TTL" ]]; then
         printf '%sUpdated TTL of %s record for %s from %s to %s%s\n' \
             "$C_PURPLE" "$type" "$RECORD" "$cf_ttl" "$TTL" "$C_RESET"
         NOTIFY_LINES+=("Updated TTL of $type record for $RECORD: $cf_ttl -> $TTL")
+        else
+            printf '%sDisabled Cloudflare proxying for %s record %s%s\n' "$C_PURPLE" "$type" "$RECORD" "$C_RESET"
+            NOTIFY_LINES+=("Disabled proxying for $type record $RECORD")
+        fi
     else
         qprint "${C_YELLOW}No change to $type record for $RECORD, $cf_ip${C_RESET}"
     fi
@@ -534,6 +618,7 @@ sync_host_record() {
 on_exit() {
     local rc=$?
     set +e
+    [[ -n "$CF_AUTH_CONFIG" ]] && rm -f -- "$CF_AUTH_CONFIG"
     if (( rc != 0 )); then
         if [[ "$A_ATTEMPTED" = true && "$A_OK" = false && -n "$A_HC" ]]; then
             "${CURL_GET[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
@@ -542,12 +627,12 @@ on_exit() {
             "${CURL_GET[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
         fi
     fi
-    if [[ ${#NOTIFY_LINES[@]} -gt 0 ]] && command -v sendmail >/dev/null; then
+    if { [[ ${#NOTIFY_LINES[@]} -gt 0 ]] || (( rc != 0 )); } && command -v sendmail >/dev/null; then
         local host date_hdr subject
         host=$(hostname -f 2>/dev/null || hostname)
         date_hdr=$(date -R)
-        subject="[$host] Cloudflare DDNS for $RECORD updated"
-        (( rc != 0 )) && subject="[$host] Cloudflare DDNS for $RECORD updated (with errors, rc=$rc)"
+        subject="[$host] Cloudflare DDNS for ${RECORD:-unknown} updated"
+        (( rc != 0 )) && subject="[$host] Cloudflare DDNS for ${RECORD:-unknown} failed (rc=$rc)"
         {
             printf 'To: root\n'
             printf 'Date: %s\n' "$date_hdr"
@@ -556,6 +641,12 @@ on_exit() {
             printf 'Content-Type: text/plain; charset=UTF-8\n'
             printf '\n'
             printf '%s\n' "${NOTIFY_LINES[@]}"
+            if (( rc != 0 )); then
+                printf '\nRecord: %s\nExit code: %s\n' "${RECORD:-unknown}" "$rc"
+                printf 'Attempted families: A=%s, AAAA=%s\n' "$A_ATTEMPTED" "$AAAA_ATTEMPTED"
+                printf 'Synchronization succeeded: A=%s, AAAA=%s\n' "$A_OK" "$AAAA_OK"
+                printf 'Inspect the systemd journal for detailed errors.\n'
+            fi
         } | sendmail root || true
     fi
     exit "$rc"
@@ -591,10 +682,16 @@ if [[ "$DO_IPV4" = false && "$DO_IPV6" = false ]]; then
     DO_IPV6=true
 fi
 
+# Explicit source policy: external (the default) or interface:<name>.
+A_SOURCE=${CLOUDFLARE_DDNS_A_SOURCE:-external}
+AAAA_SOURCE=${CLOUDFLARE_DDNS_AAAA_SOURCE:-external}
+case "$A_SOURCE" in external|interface:?*) ;; *) err "Invalid CLOUDFLARE_DDNS_A_SOURCE: $A_SOURCE"; exit 1;; esac
+case "$AAAA_SOURCE" in external|interface:?*) ;; *) err "Invalid CLOUDFLARE_DDNS_AAAA_SOURCE: $AAAA_SOURCE"; exit 1;; esac
+
 # ---- preflight checks ----
 load_systemd_credentials
 require_cmd curl jq flock awk tr
-if [[ -n "${CLOUDFLARE_DDNS_AAAA_IFACE:-}" ]]; then
+if [[ "$A_SOURCE" == interface:* || "$AAAA_SOURCE" == interface:* ]]; then
     require_cmd ip
 fi
 
@@ -636,7 +733,12 @@ verify_token
 # ---- A record ----
 if [[ "$DO_IPV4" = true ]]; then
     A_ATTEMPTED=true
-    IPV4=$(get_ip -4)
+    if [[ "$A_SOURCE" == interface:* ]]; then
+        IPV4=$(select_interface_ipv4 "${A_SOURCE#interface:}")
+        verify_interface_ip -4 "$IPV4"
+    else
+        IPV4=$(get_ip -4)
+    fi
     if ! valid_ipv4 "$IPV4"; then
         err "Invalid IPv4 detected: $IPV4"
         exit 1
@@ -649,21 +751,18 @@ fi
 # ---- AAAA record ----
 if [[ "$DO_IPV6" = true ]]; then
     AAAA_ATTEMPTED=true
-    if [[ -n "${CLOUDFLARE_DDNS_AAAA_IFACE:-}" ]]; then
-        IPV6=$(ip -6 addr show dev "$CLOUDFLARE_DDNS_AAAA_IFACE" scope global \
-            | awk '
-                /inet6/ {
-                    if ($0 ~ /(^|[[:space:]])(temporary|deprecated|tentative|dadfailed)([[:space:]]|$)/) next
-                    split($2,a,"/")
-                    addr=a[1]
-                    if (addr !~ /^(fd|fc)/ && addr !~ /^fe80:/) {
-                        print addr
-                        exit
-                    }
-                }')
-        if [[ -z "$IPV6" ]]; then
-            err "No stable global IPv6 address found on interface $CLOUDFLARE_DDNS_AAAA_IFACE"
-            exit 1
+    if [[ "$AAAA_SOURCE" == interface:* ]]; then
+        published=$(get_records_checked AAAA)
+        { read -r _; read -r published_ip; } < <(parse_record "$published")
+        IPV6=$(select_interface_ipv6 "${AAAA_SOURCE#interface:}" "$published_ip")
+        if ! verify_interface_ip -6 "$IPV6"; then
+            if [[ -n "$published_ip" && "$IPV6" == "$published_ip" ]]; then
+                err "Published IPv6 address is no longer externally usable; trying the longest-lived preferred alternative"
+                IPV6=$(select_interface_ipv6 "${AAAA_SOURCE#interface:}" "" "$published_ip")
+                verify_interface_ip -6 "$IPV6"
+            else
+                exit 1
+            fi
         fi
     else
         IPV6=$(get_ip -6)

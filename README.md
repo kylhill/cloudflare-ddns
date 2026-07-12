@@ -15,12 +15,14 @@ Options:
   -6  Only update AAAA record with external IPv6 address
 ```
 
-## Required credentials
+## Required variables
 
 | Variable                | Purpose                                       |
 | ----------------------- | --------------------------------------------- |
 | `CLOUDFLARE_API_TOKEN`  | Scoped Cloudflare API token (Zone:DNS:Edit)   |
 | `CLOUDFLARE_ZONE_ID`    | Zone ID containing the record to update       |
+| `CLOUDFLARE_DDNS_A_SOURCE` | IPv4 source: `external` or `interface:<name>` |
+| `CLOUDFLARE_DDNS_AAAA_SOURCE` | IPv6 source: `external` or `interface:<name>` |
 | `A_HC` *(optional)*     | Healthchecks.io URL for the A record run      |
 | `AAAA_HC` *(optional)*  | Healthchecks.io URL for the AAAA record run   |
 
@@ -28,10 +30,19 @@ Options:
 variables or as systemd credentials named `cloudflare_api_token` and
 `cloudflare_zone_id`.
 
+Both address-source variables default to `external`. Interface mode selects a
+public address from the named interface and verifies it with a source-bound
+external request before changing DNS. For example:
+
+```sh
+CLOUDFLARE_DDNS_A_SOURCE=interface:wan
+CLOUDFLARE_DDNS_AAAA_SOURCE=interface:lan
+```
+
 ## Dependencies
 
 - `bash`, `curl`, `jq`, `flock`, `awk`, `tr`
-- `ip` when `CLOUDFLARE_DDNS_AAAA_IFACE` is set
+- `ip` when either address source uses `interface:<name>`
 - `sendmail` (optional; used to email a per-run change summary to `root`)
 
 ## Validation
