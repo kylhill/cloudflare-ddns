@@ -26,10 +26,8 @@ DO_IPV4=false
 DO_IPV6=false
 IPV4=""
 IPV6=""
-A_ATTEMPTED=false
-AAAA_ATTEMPTED=false
-A_OK=false
-AAAA_OK=false
+A_STATUS=disabled
+AAAA_STATUS=disabled
 USER_AGENT="cloudflare-ddns/2.3"
 
 CF_API="https://api.cloudflare.com/client/v4"
@@ -73,10 +71,7 @@ fi
 
 # Notification batch (one mail per run)
 NOTIFY_LINES=()
-PLANNED_OUTPUT=()
-PLANNED_NOTIFY=()
-PATCHES_JSON='[]'
-POSTS_JSON='[]'
+PLAN_JSON='{"patches":[],"posts":[],"messages":[]}'
 
 print_usage() {
     cat <<EOF
@@ -184,18 +179,20 @@ valid_ip_for_family() {
     esac
 }
 
-# Fetch external IP for the given family from one of several providers.
-# Usage: get_ip -4|-6
-get_ip() {
-    local family="$1" url ip last_err=""
-    case "$family" in -4|-6) ;; *) err "get_ip: must specify -4 or -6"; return 1;; esac
+# Query an externally observed IP, optionally binding to an exact source IP.
+# Usage: query_external_ip -4|-6 [SOURCE_IP]
+query_external_ip() {
+    local family="$1" source_ip="${2:-}" url ip last_err=""
+    local -a bind_args=()
+    case "$family" in -4|-6) ;; *) err "query_external_ip: must specify -4 or -6"; return 1;; esac
+    [[ -n "$source_ip" ]] && bind_args=(--interface "$source_ip")
 
     for url in \
         "https://api.cloudflare.com/cdn-cgi/trace" \
         "https://icanhazip.com" \
         "https://ifconfig.co"
     do
-        if ! ip=$("${CURL_IP[@]}" "$family" "$url" 2>&1); then
+        if ! ip=$("${CURL_IP[@]}" "$family" "${bind_args[@]}" "$url" 2>&1); then
             last_err="$ip"
             continue
         fi
@@ -210,33 +207,17 @@ get_ip() {
         fi
         last_err="invalid response from $url: $ip"
     done
-    err "Failed to determine external IP ($family). Last error: $last_err"
-    return 1
-}
-
-observe_ip() {
-    local family="$1" source_ip="$2" url ip last_err=""
-    for url in "https://api.cloudflare.com/cdn-cgi/trace" "https://icanhazip.com" "https://ifconfig.co"; do
-        if ! ip=$("${CURL_IP[@]}" "$family" --interface "$source_ip" "$url" 2>&1); then
-            last_err="$ip"; continue
-        fi
-        if [[ "$url" == *cdn-cgi/trace* ]]; then
-            ip=$(awk -F= '/^ip=/ { print $2; exit }' <<<"$ip")
-        else
-            ip=$(printf '%s' "$ip" | tr -d '[:space:]')
-        fi
-        if valid_ip_for_family "$family" "$ip"; then
-            printf '%s' "$ip"; return 0
-        fi
-        last_err="invalid response from $url: $ip"
-    done
-    err "Failed to verify interface address $source_ip ($family). Last error: $last_err"
+    if [[ -n "$source_ip" ]]; then
+        err "Failed to verify interface address $source_ip ($family). Last error: $last_err"
+    else
+        err "Failed to determine external IP ($family). Last error: $last_err"
+    fi
     return 1
 }
 
 verify_interface_ip() {
     local family="$1" selected="$2" observed
-    observed=$(observe_ip "$family" "$selected") || return 1
+    observed=$(query_external_ip "$family" "$selected") || return 1
     if [[ "$observed" != "$selected" ]]; then
         err "Interface address $selected does not match externally observed address $observed ($family)"
         return 1
@@ -353,16 +334,6 @@ create_curl_auth_config() {
     chmod 600 "$CF_AUTH_CONFIG"
 }
 
-verify_token() {
-    local body
-    body=$(cf_api_get "/user/tokens/verify") || {
-        err "Token verification request failed"
-        [[ -n "$body" ]] && printf '%s\n' "$body" >&2
-        return 1
-    }
-    check_success "$body" "token verification"
-}
-
 get_records_checked() {
     local type="$1" body
     body=$(get_records "$type") || {
@@ -371,6 +342,7 @@ get_records_checked() {
         return 1
     }
     check_success "$body" "list $type records"
+    validate_single_record "$type" "$body" || return 1
     printf '%s' "$body"
 }
 
@@ -428,33 +400,14 @@ svcparam_token_value() {
     printf '%s' "$token_value"
 }
 
-svcparam_get() {
-    local value="$1" key="$2" token="" ch token_key
-    local in_quote=0 i
-    for (( i = 0; i < ${#value}; i++ )); do
-        ch="${value:i:1}"
-        if [[ "$ch" == '"' ]]; then
-            token+="$ch"
-            if (( in_quote )); then in_quote=0; else in_quote=1; fi
-        elif [[ "$ch" =~ [[:space:]] && $in_quote -eq 0 ]]; then
-            token_key="${token%%=*}"
-            if [[ "$token_key" == "$key" ]]; then
-                svcparam_token_value "$token"
-                return 0
-            fi
-            token=""
-        else
-            token+="$ch"
-        fi
-    done
-    token_key="${token%%=*}"
-    if [[ "$token_key" == "$key" ]]; then
-        svcparam_token_value "$token"
-    fi
+append_plan_operation() {
+    local collection="$1" operation="$2" output="$3" notification="$4" family="$5"
+    PLAN_JSON=$(jq -c \
+        --arg collection "$collection" --argjson operation "$operation" \
+        --arg output "$output" --arg notification "$notification" --arg family "$family" \
+        '.[$collection] += [$operation] |
+         .messages += [{console:$output, notification:$notification, family:$family}]' <<<"$PLAN_JSON")
 }
-
-append_batch_patch() { PATCHES_JSON=$(jq -c --argjson op "$1" '. + [$op]' <<<"$PATCHES_JSON"); }
-append_batch_post()  { POSTS_JSON=$(jq -c --argjson op "$1" '. + [$op]' <<<"$POSTS_JSON"); }
 
 validate_single_record() {
     local type="$1" response="$2" pages count
@@ -473,21 +426,19 @@ validate_single_record() {
 plan_host_record() {
     local type="$1" ip="$2" response="$3"
     local cf_id cf_ip cf_proxied cf_ttl data message output
-    validate_single_record "$type" "$response"
     { read -r cf_id; read -r cf_ip; read -r cf_proxied; read -r cf_ttl; } < <(parse_record "$response")
 
     if [[ -z "$cf_id" ]]; then
         data=$(jq -nc --arg type "$type" --arg name "$RECORD" --arg ip "$ip" \
             --argjson ttl "$TTL" '{type:$type, name:$name, content:$ip, ttl:$ttl, proxied:false}')
-        append_batch_post "$data"
         output="Created new $type record for $RECORD, $ip"
         message="Created $type record for $RECORD: $ip"
+        append_plan_operation posts "$data" "$output" "$message" "$type"
     elif [[ "$ip" != "$cf_ip" || "$cf_ttl" != "$TTL" || "$cf_proxied" != false ]]; then
         data=$(jq -nc --arg id "$cf_id" '{id:$id}')
         [[ "$ip" != "$cf_ip" ]] && data=$(jq -c --arg value "$ip" '.content=$value' <<<"$data")
         [[ "$cf_ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
         [[ "$cf_proxied" != false ]] && data=$(jq -c '.proxied=false' <<<"$data")
-        append_batch_patch "$data"
         if [[ "$ip" != "$cf_ip" ]]; then
             output="Updated $type record for $RECORD from $cf_ip to $ip"
             message="Updated $type record for $RECORD: $cf_ip -> $ip"
@@ -498,65 +449,48 @@ plan_host_record() {
             output="Disabled Cloudflare proxying for $type record $RECORD"
             message="Disabled proxying for $type record $RECORD"
         fi
+        append_plan_operation patches "$data" "$output" "$message" "$type"
     else
         qprint "${C_YELLOW}No change to $type record for $RECORD, $cf_ip${C_RESET}"
         return 0
     fi
-    PLANNED_OUTPUT+=("$output")
-    PLANNED_NOTIFY+=("$message")
 }
 
-flush_svcparam_token() {
-    local key="$1" token="$2" out="$3" token_key
-    [[ -z "$token" ]] && { printf '%s' "$out"; return 0; }
-    token_key="${token%%=*}"
-    if [[ "$token_key" == "$key" ]]; then
-        printf '%s' "$out"
-    elif [[ -z "$out" ]]; then
-        printf '%s' "$token"
-    else
-        printf '%s %s' "$out" "$token"
-    fi
-}
-
-svcparam_without_key() {
-    local value="$1" key="$2" token="" out="" ch
-    local in_quote=0 i
+# Parse the SvcParams once, extract both existing hints, and rebuild the value
+# while preserving all unrelated tokens. Outputs old IPv4 hint, old IPv6 hint,
+# and the desired value on separate lines.
+transform_https_hints() {
+    local value="${1:-}" ipv4="$2" ipv6="$3" token="" ch key item out=""
+    local old4="" old6="" in_quote=0 i
+    local -a tokens=()
+    [[ -z "$value" ]] && value='alpn="h3,h2"'
     for (( i = 0; i < ${#value}; i++ )); do
         ch="${value:i:1}"
         if [[ "$ch" == '"' ]]; then
             token+="$ch"
-            if (( in_quote )); then in_quote=0; else in_quote=1; fi
+            in_quote=$((1 - in_quote))
         elif [[ "$ch" =~ [[:space:]] && $in_quote -eq 0 ]]; then
-            out=$(flush_svcparam_token "$key" "$token" "$out")
+            [[ -n "$token" ]] && tokens+=("$token")
             token=""
         else
             token+="$ch"
         fi
     done
-    flush_svcparam_token "$key" "$token" "$out"
-}
+    [[ -n "$token" ]] && tokens+=("$token")
 
-svcparam_set_quoted() {
-    local value="$1" key="$2" new="$3"
-    value=$(svcparam_without_key "$value" "$key")
-    if [[ -z "$new" ]]; then
-        printf '%s' "$value"
-    elif [[ -z "$value" ]]; then
-        printf '%s="%s"' "$key" "$new"
-    else
-        printf '%s %s="%s"' "$value" "$key" "$new"
-    fi
-}
-
-# Build SvcParams string for an HTTPS record. Preserve every existing
-# SvcParam except the address hints refreshed by this run.
-https_value() {
-    local ipv4="$1" ipv6="$2" value="${3:-}"
-    [[ -z "$value" ]] && value='alpn="h3,h2"'
-    value=$(svcparam_set_quoted "$value" ipv4hint "$ipv4")
-    value=$(svcparam_set_quoted "$value" ipv6hint "$ipv6")
-    printf '%s' "$value"
+    for item in "${tokens[@]}"; do
+        key="${item%%=*}"
+        case "$key" in
+            ipv4hint) old4=$(svcparam_token_value "$item") || old4="" ;;
+            ipv6hint) old6=$(svcparam_token_value "$item") || old6="" ;;
+            *) out+="${out:+ }$item" ;;
+        esac
+    done
+    [[ "$DO_IPV4" = false ]] && ipv4="$old4"
+    [[ "$DO_IPV6" = false ]] && ipv6="$old6"
+    [[ -n "$ipv4" ]] && out+="${out:+ }ipv4hint=\"$ipv4\""
+    [[ -n "$ipv6" ]] && out+="${out:+ }ipv6hint=\"$ipv6\""
+    printf '%s\n%s\n%s\n' "$old4" "$old6" "$out"
 }
 
 https_record_data() {
@@ -573,19 +507,16 @@ https_record_data() {
 plan_https_record() {
     local ipv4="$1" ipv6="$2" response="$3"
     local id value priority target ttl old4 old6 new_value data output message
-    validate_single_record HTTPS "$response"
     { read -r id; read -r value; read -r priority; read -r target; read -r ttl; } < <(parse_https_record "$response")
-    old4=$(svcparam_get "$value" ipv4hint) || old4=""
-    old6=$(svcparam_get "$value" ipv6hint) || old6=""
+    { read -r old4; read -r old6; read -r new_value; } < <(transform_https_hints "$value" "$ipv4" "$ipv6")
     [[ "$DO_IPV4" = false ]] && ipv4="$old4"
     [[ "$DO_IPV6" = false ]] && ipv6="$old6"
-    new_value=$(https_value "$ipv4" "$ipv6" "$value")
 
     if [[ -z "$id" ]]; then
         data=$(https_record_data "$new_value")
-        append_batch_post "$data"
         output="Created new HTTPS record for $RECORD"
         message="Created HTTPS record for $RECORD"
+        append_plan_operation posts "$data" "$output" "$message" HTTPS
     elif [[ "$old4" != "$ipv4" || "$old6" != "$ipv6" || "$ttl" != "$TTL" ]]; then
         data=$(jq -nc --arg id "$id" '{id:$id}')
         if [[ "$old4" != "$ipv4" || "$old6" != "$ipv6" ]]; then
@@ -593,15 +524,13 @@ plan_https_record() {
                 '.data={priority:$priority,target:$target,value:$value}' <<<"$data")
         fi
         [[ "$ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
-        append_batch_patch "$data"
         output="Updated HTTPS record for $RECORD"
         message="Updated HTTPS record for $RECORD (ipv4hint=$ipv4 ipv6hint=$ipv6)"
+        append_plan_operation patches "$data" "$output" "$message" HTTPS
     else
         qprint "${C_YELLOW}No change to HTTPS record for $RECORD${C_RESET}"
         return 0
     fi
-    PLANNED_OUTPUT+=("$output")
-    PLANNED_NOTIFY+=("$message")
 }
 
 ping_hc() {
@@ -612,10 +541,9 @@ ping_hc() {
 
 submit_dns_batch() {
     local batch body expected_patches expected_posts actual_patches actual_posts
-    expected_patches=$(jq 'length' <<<"$PATCHES_JSON")
-    expected_posts=$(jq 'length' <<<"$POSTS_JSON")
-    batch=$(jq -nc --argjson patches "$PATCHES_JSON" --argjson posts "$POSTS_JSON" \
-        '{patches:$patches, posts:$posts}')
+    expected_patches=$(jq '.patches | length' <<<"$PLAN_JSON")
+    expected_posts=$(jq '.posts | length' <<<"$PLAN_JSON")
+    batch=$(jq -c '{patches, posts} | with_entries(select(.value | length > 0))' <<<"$PLAN_JSON")
     if ! body=$(cf_api_batch "$batch"); then
         err "Cloudflare DNS batch request failed; its outcome may be ambiguous. Check Cloudflare state before retrying."
         [[ -n "$body" ]] && printf '%s\n' "$body" >&2
@@ -635,9 +563,8 @@ submit_dns_batch() {
     fi
 }
 
-# Exit trap: ping failed attempted families and flush batched notification
-# email so partial progress (e.g. a successful A update before an AAAA
-# failure) still gets reported.
+# Exit trap: ping failed attempted families, remove temporary credentials, and
+# send one notification for completed changes or a failed run.
 # `set +e` so a "false" condition (e.g. empty NOTIFY_LINES) inside the trap
 # doesn't override the script's real exit status under `set -e`.
 on_exit() {
@@ -645,10 +572,10 @@ on_exit() {
     set +e
     [[ -n "$CF_AUTH_CONFIG" ]] && rm -f -- "$CF_AUTH_CONFIG"
     if (( rc != 0 )); then
-        if [[ "$A_ATTEMPTED" = true && "$A_OK" = false && -n "$A_HC" ]]; then
+        if [[ "$A_STATUS" == attempted && -n "$A_HC" ]]; then
             "${CURL_GET[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
         fi
-        if [[ "$AAAA_ATTEMPTED" = true && "$AAAA_OK" = false && -n "$AAAA_HC" ]]; then
+        if [[ "$AAAA_STATUS" == attempted && -n "$AAAA_HC" ]]; then
             "${CURL_GET[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
         fi
     fi
@@ -668,8 +595,7 @@ on_exit() {
             printf '%s\n' "${NOTIFY_LINES[@]}"
             if (( rc != 0 )); then
                 printf '\nRecord: %s\nExit code: %s\n' "${RECORD:-unknown}" "$rc"
-                printf 'Attempted families: A=%s, AAAA=%s\n' "$A_ATTEMPTED" "$AAAA_ATTEMPTED"
-                printf 'Synchronization succeeded: A=%s, AAAA=%s\n' "$A_OK" "$AAAA_OK"
+                printf 'Family status: A=%s, AAAA=%s\n' "$A_STATUS" "$AAAA_STATUS"
                 printf 'Inspect the systemd journal for detailed errors.\n'
             fi
         } | sendmail root || true
@@ -752,24 +678,18 @@ if ! flock -n 9; then
     exit 1
 fi
 
-# ---- API token sanity check ----
-verify_token
-
 # ---- fetch and validate current records before planning any mutations ----
 A_RESPONSE=''; AAAA_RESPONSE=''; HTTPS_RESPONSE=''
 if [[ "$DO_IPV4" = true ]]; then
-    A_ATTEMPTED=true
+    A_STATUS=attempted
     A_RESPONSE=$(get_records_checked A)
-    validate_single_record A "$A_RESPONSE"
 fi
 if [[ "$DO_IPV6" = true ]]; then
-    AAAA_ATTEMPTED=true
+    AAAA_STATUS=attempted
     AAAA_RESPONSE=$(get_records_checked AAAA)
-    validate_single_record AAAA "$AAAA_RESPONSE"
 fi
 if [[ "$DO_HTTPS" = true ]]; then
     HTTPS_RESPONSE=$(get_records_checked HTTPS)
-    validate_single_record HTTPS "$HTTPS_RESPONSE"
 fi
 
 # ---- discover and validate every requested address ----
@@ -778,7 +698,7 @@ if [[ "$DO_IPV4" = true ]]; then
         IPV4=$(select_interface_ipv4 "${A_SOURCE#interface:}")
         verify_interface_ip -4 "$IPV4"
     else
-        IPV4=$(get_ip -4)
+        IPV4=$(query_external_ip -4)
     fi
     if ! valid_ipv4 "$IPV4"; then
         err "Invalid IPv4 detected: $IPV4"
@@ -801,7 +721,7 @@ if [[ "$DO_IPV6" = true ]]; then
             fi
         fi
     else
-        IPV6=$(get_ip -6)
+        IPV6=$(query_external_ip -6)
     fi
     if ! valid_ipv6 "$IPV6"; then
         err "Invalid IPv6 detected: $IPV6"
@@ -818,23 +738,24 @@ if [[ "$DO_HTTPS" = true ]]; then
 fi
 
 # ---- apply all planned changes as one database transaction ----
-patch_count=$(jq 'length' <<<"$PATCHES_JSON")
-post_count=$(jq 'length' <<<"$POSTS_JSON")
+patch_count=$(jq '.patches | length' <<<"$PLAN_JSON")
+post_count=$(jq '.posts | length' <<<"$PLAN_JSON")
 if (( patch_count > 0 || post_count > 0 )); then
     submit_dns_batch
-    for line in "${PLANNED_OUTPUT[@]}"; do
+    mapfile -t completed_output < <(jq -r '.messages[].console' <<<"$PLAN_JSON")
+    for line in "${completed_output[@]}"; do
         printf '%s%s%s\n' "$C_PURPLE" "$line" "$C_RESET"
     done
-    NOTIFY_LINES+=("${PLANNED_NOTIFY[@]}")
+    mapfile -t NOTIFY_LINES < <(jq -r '.messages[].notification' <<<"$PLAN_JSON")
 fi
 
 # Changed families become successful only after the batch succeeds. Unchanged
 # families are successful once discovery, query, validation, and planning pass.
 if [[ "$DO_IPV4" = true ]]; then
-    A_OK=true
+    A_STATUS=successful
     ping_hc "$A_HC"
 fi
 if [[ "$DO_IPV6" = true ]]; then
-    AAAA_OK=true
+    AAAA_STATUS=successful
     ping_hc "$AAAA_HC"
 fi

@@ -44,12 +44,11 @@ The script is a single linear flow:
 2. **Preflight checks** — verifies required commands installed, env vars set, FQDN valid, TTL valid, `RUNTIME_DIRECTORY` set
 3. **Credential loading** — reads `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ZONE_ID` from the environment, or from systemd credentials in `$CREDENTIALS_DIRECTORY`
 4. **Single-instance lock** via `flock` on `$RUNTIME_DIRECTORY/<record>.lock` — the script **requires** `RUNTIME_DIRECTORY` to be set (exported by systemd's `RuntimeDirectory=cloudflare-ddns`)
-5. **Token verification** — calls `GET /user/tokens/verify`
-6. **Record fetch** — fetches and duplicate-checks all requested A, AAAA, and HTTPS records before planning changes
-7. **IP detection** (`get_ip -4|-6` or interface selection) — discovers and validates every requested address
-8. **Batch planning** — builds minimal `patches` and complete `posts` arrays without mutating Cloudflare
-9. **Batch submission** — sends at most one non-retried `POST /dns_records/batch`, then validates the complete response before reporting success
-10. **Exit trap** — pings `/fail` on Healthchecks.io for any attempted-but-failed family; emails `root` via `sendmail` for changes or failures
+5. **Record fetch** — fetches and duplicate-checks all requested A, AAAA, and HTTPS records before planning changes; these queries also validate token and zone permissions
+6. **IP detection** (`query_external_ip -4|-6` or interface selection) — discovers and validates every requested address
+7. **Batch planning** — builds one plan containing minimal `patches`, complete `posts`, and reporting metadata without mutating Cloudflare
+8. **Batch submission** — sends at most one non-retried `POST /dns_records/batch`, then validates the complete response before reporting success
+9. **Exit trap** — pings `/fail` on Healthchecks.io for any attempted-but-failed family; emails `root` via `sendmail` for changes or failures
 
 ## Key Conventions
 

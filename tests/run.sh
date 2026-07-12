@@ -92,11 +92,6 @@ records_response() {
         '{success:true, result:$result, result_info:{count:($result | length), total_count:$total, total_pages:$pages}}'
 }
 
-if [[ "$url" == */user/tokens/verify ]]; then
-    printf '{"success":true,"result":{"status":"active"}}\n'
-    exit 0
-fi
-
 if [[ "$url" == *cdn-cgi/trace ]]; then
     if [[ -n "$source_ip" ]]; then
         printf 'ip=%s\n' "$source_ip"
