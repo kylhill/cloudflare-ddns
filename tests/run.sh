@@ -428,6 +428,8 @@ post_line=$(grep 'method=POST' "$CURL_LOG")
 [[ "$post_line" == *'/dns_records/batch'* ]] || fail "creation did not use batch endpoint"
 assert_contains "$CURL_LOG" "raw=-q"
 assert_not_contains "$CURL_LOG" "Authorization: Bearer test-token"
+assert_contains "$SENDMAIL_LOG" "Cloudflare DDNS for example.com updated"
+assert_contains "$SENDMAIL_LOG" "Created A record for example.com: 198.51.100.42"
 
 reset_logs
 credentials_output="$TEST_TMP/systemd credentials are supported.out"
@@ -561,8 +563,7 @@ assert_not_contains "$CURL_LOG" "/dns_records/batch"
 expect_failure "batch operation error reports no completed changes" batch_failure -s example.com
 assert_contains "$TEST_TMP/batch operation error reports no completed changes.out" "invalid HTTPS fixture"
 assert_not_contains "$TEST_TMP/batch operation error reports no completed changes.out" "Updated A record"
-assert_contains "$SENDMAIL_LOG" "Family status: A=attempted, AAAA=attempted"
-assert_contains "$SENDMAIL_LOG" "Inspect the systemd journal for detailed errors."
+[[ ! -s "$SENDMAIL_LOG" ]] || fail "failed batch sent an email notification"
 
 expect_failure "batch timeout is not retried" batch_timeout -s example.com
 [[ $(grep -c '/dns_records/batch' "$CURL_LOG") -eq 1 ]] || fail "timed-out batch was retried"

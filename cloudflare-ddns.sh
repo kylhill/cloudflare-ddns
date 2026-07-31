@@ -630,7 +630,7 @@ submit_dns_batch() {
 }
 
 # Exit trap: ping failed attempted families, remove temporary credentials, and
-# send one notification for completed changes or a failed run.
+# send one notification for completed changes.
 # `set +e` so a "false" condition (e.g. empty NOTIFY_LINES) inside the trap
 # doesn't override the script's real exit status under `set -e`.
 on_exit() {
@@ -645,12 +645,11 @@ on_exit() {
             "${CURL_GET[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
         fi
     fi
-    if { [[ ${#NOTIFY_LINES[@]} -gt 0 ]] || (( rc != 0 )); } && command -v sendmail >/dev/null; then
+    if [[ ${#NOTIFY_LINES[@]} -gt 0 ]] && command -v sendmail >/dev/null; then
         local host date_hdr subject
         host=$(hostname -f 2>/dev/null || hostname)
         date_hdr=$(date -R)
         subject="[$host] Cloudflare DDNS for ${RECORD:-unknown} updated"
-        (( rc != 0 )) && subject="[$host] Cloudflare DDNS for ${RECORD:-unknown} failed (rc=$rc)"
         {
             printf 'To: root\n'
             printf 'Date: %s\n' "$date_hdr"
@@ -659,11 +658,6 @@ on_exit() {
             printf 'Content-Type: text/plain; charset=UTF-8\n'
             printf '\n'
             printf '%s\n' "${NOTIFY_LINES[@]}"
-            if (( rc != 0 )); then
-                printf '\nRecord: %s\nExit code: %s\n' "${RECORD:-unknown}" "$rc"
-                printf 'Family status: A=%s, AAAA=%s\n' "$A_STATUS" "$AAAA_STATUS"
-                printf 'Inspect the systemd journal for detailed errors.\n'
-            fi
         } | sendmail root || true
     fi
     exit "$rc"
