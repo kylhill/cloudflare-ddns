@@ -1,0 +1,39 @@
+[Unit]
+Description=Update Cloudflare Dynamic DNS records
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=5min
+DynamicUser=yes
+UMask=0077
+
+RuntimeDirectory=cloudflare-ddns
+RuntimeDirectoryMode=0700
+
+LoadCredential=cloudflare_api_token:/etc/cloudflare-ddns/api-token
+LoadCredential=cloudflare_zone_id:/etc/cloudflare-ddns/zone-id
+Environment="CLOUDFLARE_DDNS_A_SOURCE=external"
+Environment="CLOUDFLARE_DDNS_AAAA_SOURCE=external"
+# Environment="A_HC=https://hc-ping.com/replace-with-your-ping-key"
+# Environment="AAAA_HC=https://hc-ping.com/replace-with-your-ping-key"
+
+# Replace host.example.com and adjust flags or TTL for your deployment.
+ExecStart=/usr/local/bin/cloudflare-ddns.sh -q -t 3600 host.example.com
+
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+SystemCallArchitectures=native

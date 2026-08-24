@@ -426,10 +426,8 @@ load_systemd_credentials() {
 }
 
 create_curl_auth_config() {
-    umask 077
     CF_AUTH_CONFIG=$(mktemp "$STATE_DIR/cloudflare-auth.XXXXXX")
     printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" >"$CF_AUTH_CONFIG"
-    chmod 600 "$CF_AUTH_CONFIG"
 }
 
 validate_credentials() {
@@ -794,7 +792,7 @@ fi
 
 # ---- preflight checks ----
 load_systemd_credentials
-require_cmd curl jq flock awk tr mktemp chmod rm head
+require_cmd curl jq flock awk tr mktemp rm head
 if { [[ "$DO_IPV4" = true && "$A_SOURCE" == interface:* ]] ||
      [[ "$DO_IPV6" = true && "$AAAA_SOURCE" == interface:* ]]; }; then
     require_cmd ip
@@ -819,13 +817,13 @@ if [[ ! -d "$STATE_DIR" || ! -w "$STATE_DIR" ]]; then
     err "Runtime directory is not writable: $STATE_DIR"
     exit 1
 fi
-create_curl_auth_config
 LOCK_FILE="$STATE_DIR/${RECORD}.lock"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+exec {LOCK_FD}>"$LOCK_FILE"
+if ! flock -n "$LOCK_FD"; then
     err "Another instance is already running for $RECORD"
     exit 1
 fi
+create_curl_auth_config
 
 # ---- fetch and validate current records before planning any mutations ----
 A_RESPONSE=''; AAAA_RESPONSE=''; HTTPS_RESPONSE=''

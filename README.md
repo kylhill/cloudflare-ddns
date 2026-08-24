@@ -57,7 +57,7 @@ update.
 
 - Bash 4 or newer
 - curl 7.76 or newer, `jq`, and `flock`
-- Standard system utilities: `awk`, `tr`, `mktemp`, `chmod`, `rm`, `head`,
+- Standard system utilities: `awk`, `tr`, `mktemp`, `rm`, `head`,
   `hostname`, and `date`
 - `ip` when either address source uses `interface:<name>`
 - `sendmail` (optional; used to email a per-run change summary to `root`)
@@ -72,3 +72,16 @@ tests/run.sh
 
 The test harness mocks external commands and does not contact Cloudflare or IP
 lookup providers.
+
+## Example systemd units
+
+The repository includes [cloudflare-ddns.service](cloudflare-ddns.service) and
+[cloudflare-ddns.timer](cloudflare-ddns.timer), adapted from the deployment
+units used by the accompanying infrastructure role. Before installing them:
+
+1. Replace `host.example.com` in `ExecStart` with the record to update and
+   adjust the flags, TTL, address sources, and optional healthcheck URLs.
+2. Store the token and zone ID in `/etc/cloudflare-ddns/api-token` and
+   `/etc/cloudflare-ddns/zone-id`, owned by root with mode `0400`.
+3. Install the script at `/usr/local/bin/cloudflare-ddns.sh` and the units under
+   `/etc/systemd/system/`, then enable `cloudflare-ddns.timer`.

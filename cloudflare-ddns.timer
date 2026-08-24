@@ -1,0 +1,13 @@
+[Unit]
+Description=Update Cloudflare Dynamic DNS records
+
+[Timer]
+OnBootSec=1m
+OnUnitActiveSec=1h
+AccuracySec=1m
+RandomizedDelaySec=1m
+FixedRandomDelay=yes
+Persistent=true
+
+[Install]
+WantedBy=timers.target

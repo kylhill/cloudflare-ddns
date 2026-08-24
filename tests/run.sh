@@ -381,7 +381,14 @@ set -euo pipefail
 cat >>"$TEST_SENDMAIL_LOG"
 EOF
 
-chmod +x "$MOCKBIN/curl" "$MOCKBIN/ip" "$MOCKBIN/sendmail"
+cat >"$MOCKBIN/flock" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${TEST_SCENARIO:-}" == lock_held ]] && exit 1
+exec /usr/bin/flock "$@"
+EOF
+
+chmod +x "$MOCKBIN/curl" "$MOCKBIN/ip" "$MOCKBIN/sendmail" "$MOCKBIN/flock"
 
 fail() {
     printf 'not ok - %s\n' "$1" >&2
@@ -499,6 +506,13 @@ fi
 assert_contains "$CURL_LOG" "--config"
 assert_not_contains "$CURL_LOG" "Authorization: Bearer test-token"
 printf 'ok - systemd credentials are supported\n'
+
+expect_failure "lock contention creates no auth file" lock_held -4 example.com
+assert_contains "$TEST_TMP/lock contention creates no auth file.out" "Another instance is already running"
+[[ ! -s "$CURL_LOG" ]] || fail "lock contention reached curl"
+if compgen -G "$TEST_TMP/runtime-lock_held/cloudflare-auth.*" >/dev/null; then
+    fail "lock contention created a temporary auth file"
+fi
 
 expect_failure "GET failure prints response body" get_failure -4 example.com
 assert_contains "$TEST_TMP/GET failure prints response body.out" "Cloudflare API request failed while listing A records:"
