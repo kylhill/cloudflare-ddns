@@ -28,6 +28,7 @@ type=""
 name_exact=""
 url=""
 config_file=""
+output_file=""
 
 raw=""
 for arg in "$@"; do
@@ -55,6 +56,10 @@ while (($#)); do
             config_file="$2"
             shift 2
             ;;
+        -o|--output)
+            output_file="$2"
+            shift 2
+            ;;
         -4|-6)
             family="$1"
             shift
@@ -72,6 +77,8 @@ while (($#)); do
             ;;
     esac
 done
+
+[[ -n "$output_file" ]] && exec >"$output_file"
 
 config_mode=""
 [[ -n "$config_file" ]] && config_mode=$(stat -c '%a' "$config_file")
@@ -93,7 +100,7 @@ json_https_record() {
 records_response() {
     local total="$1" result="$2" pages="${3:-1}"
     jq -nc --argjson result "$result" --argjson total "$total" --argjson pages "$pages" \
-        '{success:true, result:$result, result_info:{count:($result | length), total_count:$total, total_pages:$pages}}'
+        '{success:true, errors:[], result:$result, result_info:{count:($result | length), total_count:$total, total_pages:$pages}}'
 }
 
 if [[ "$url" == *cdn-cgi/trace ]]; then
@@ -102,7 +109,15 @@ if [[ "$url" == *cdn-cgi/trace ]]; then
             printf 'ip=1.1.1.1\n'
             exit 0
         fi
+        if [[ "${TEST_SCENARIO:-}" == ipv6_fallback_equivalent && "$source_ip" == *::42 ]]; then
+            printf 'ip=2606:4700:4700::99\n'
+            exit 0
+        fi
         printf 'ip=%s\n' "$source_ip"
+        exit 0
+    fi
+    if [[ "${TEST_SCENARIO:-}" == private_provider ]]; then
+        [[ "$family" == -4 ]] && printf 'ip=10.0.0.1\n' || printf 'ip=fd00::1\n'
         exit 0
     fi
     if [[ "${TEST_SCENARIO:-}" == invalid_provider_fallback ]]; then
@@ -114,20 +129,31 @@ if [[ "$url" == *cdn-cgi/trace ]]; then
         exit 0
     fi
     case "$family" in
-        -4) printf 'ip=198.51.100.42\n' ;;
-        -6) printf 'ip=2001:db8::42\n' ;;
+        -4) printf 'ip=8.8.8.42\n' ;;
+        -6) printf 'ip=2606:4700:4700::42\n' ;;
         *) exit 7 ;;
     esac
     exit 0
 fi
 
 if [[ "$url" == *icanhazip.com ]]; then
+    if [[ "${TEST_SCENARIO:-}" == private_provider ]]; then
+        [[ "$family" == -4 ]] && printf '127.0.0.1\n' || printf 'fe80::1\n'
+        exit 0
+    fi
     case "$family" in
-        -4) printf '198.51.100.43\n' ;;
-        -6) printf '2001:db8::43\n' ;;
+        -4) printf '8.8.8.43\n' ;;
+        -6) printf '2606:4700:4700::43\n' ;;
         *) exit 7 ;;
     esac
     exit 0
+fi
+
+if [[ "$url" == *ifconfig.co ]]; then
+    if [[ "${TEST_SCENARIO:-}" == private_provider ]]; then
+        [[ "$family" == -4 ]] && printf '192.168.1.1\n' || printf '::1\n'
+        exit 0
+    fi
 fi
 
 if [[ "$url" == http://hc.example/* ]]; then
@@ -151,119 +177,143 @@ if [[ "$method" == GET && "$url" == */dns_records ]]; then
         malformed_api)
             printf '{not-json\n'
             ;;
+        missing_result)
+            printf '{"success":true,"errors":[],"result_info":{"total_pages":1}}\n'
+            ;;
+        string_success)
+            printf '{"success":"true","errors":[],"result":[],"result_info":{"total_pages":1}}\n'
+            ;;
+        retry_then_success)
+            if [[ -n "$output_file" ]]; then
+                records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
+            else
+                printf '{"temporary":"failure body"}\n'
+                records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
+            fi
+            ;;
+        private_provider)
+            if [[ "$type" == A ]]; then
+                records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
+            else
+                records_response 1 "[$(json_record AAAA1 2606:4700:4700::42 false 3600)]"
+            fi
+            ;;
         duplicate)
-            records_response 2 "[$(json_record A1 198.51.100.42 false 3600),$(json_record A2 198.51.100.43 false 3600)]"
+            records_response 2 "[$(json_record A1 8.8.8.42 false 3600),$(json_record A2 8.8.8.43 false 3600)]"
             ;;
         multi_page)
-            records_response 100 "[$(json_record A1 198.51.100.42 false 3600)]" 2
+            records_response 100 "[$(json_record A1 8.8.8.42 false 3600)]" 2
             ;;
         broad_total_count)
-            records_response 100 "[$(json_record A1 198.51.100.42 false 3600)]"
+            records_response 100 "[$(json_record A1 8.8.8.42 false 3600)]"
             ;;
         ttl60)
-            records_response 1 "[$(json_record A1 198.51.100.42 true 120)]"
+            records_response 1 "[$(json_record A1 8.8.8.42 true 120)]"
             ;;
         proxied_only)
-            records_response 1 "[$(json_record A1 198.51.100.42 true 3600)]"
+            records_response 1 "[$(json_record A1 8.8.8.42 true 3600)]"
             ;;
         lowercase)
-            records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+            records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
             ;;
         ipv6_iface)
-            records_response 1 "[$(json_record AAAA1 2001:db8::42 false 3600)]"
+            records_response 1 "[$(json_record AAAA1 2606:4700:4700::42 false 3600)]"
             ;;
         ipv6_equivalent)
-            records_response 1 "[$(json_record AAAA1 2001:0DB8:0:0:0:0:0:42 false 3600)]"
+            records_response 1 "[$(json_record AAAA1 2606:4700:4700:0:0:0:0:42 false 3600)]"
             ;;
         ipv6_tie|ipv6_longest)
-            records_response 1 "[$(json_record AAAA1 2001:db8::99 false 3600)]"
+            records_response 1 "[$(json_record AAAA1 2606:4700:4700::99 false 3600)]"
             ;;
         ipv6_published)
-            records_response 1 "[$(json_record AAAA1 2001:db8::42 false 3600)]"
+            records_response 1 "[$(json_record AAAA1 2606:4700:4700::42 false 3600)]"
+            ;;
+        ipv6_fallback_equivalent)
+            records_response 1 "[$(json_record AAAA1 2606:4700:4700:0:0:0:0:42 false 3600)]"
             ;;
         ipv4_iface|ipv4_mismatch|ipv4_ambiguous)
             records_response 1 "[$(json_record A1 8.8.4.4 false 3600)]"
             ;;
         invalid_provider_fallback)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.43 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.43 false 3600)]"
             elif [[ "$type" == AAAA ]]; then
-                records_response 1 "[$(json_record AAAA1 2001:db8::43 false 3600)]"
+                records_response 1 "[$(json_record AAAA1 2606:4700:4700::43 false 3600)]"
             else
                 records_response 0 '[]'
             fi
             ;;
         https_preserve)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.1 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.1 false 3600)]"
             elif [[ "$type" == HTTPS ]]; then
-                jq -nc --arg value 'alpn="h3,h2" port="8443" ech="abc" ipv4hint=198.51.100.1 ipv6hint=2001:db8::1' \
-                    '{success:true, result:[{id:"H1", type:"HTTPS", ttl:3600, data:{priority:2, target:"svc.example.com", value:$value}}], result_info:{count:1, total_count:1, total_pages:1}}'
+                jq -nc --arg value 'alpn="h3,h2" port="8443" ech="abc" ipv4hint=8.8.8.1 ipv6hint=2606:4700:4700::1' \
+                    '{success:true, errors:[], result:[{id:"H1", type:"HTTPS", ttl:3600, data:{priority:2, target:"svc.example.com", value:$value}}], result_info:{count:1, total_count:1, total_pages:1}}'
             else
                 records_response 0 '[]'
             fi
             ;;
         https_preserve_v6)
             if [[ "$type" == AAAA ]]; then
-                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+                records_response 1 "[$(json_record AAAA1 2606:4700:4700::1 false 3600)]"
             elif [[ "$type" == HTTPS ]]; then
-                jq -nc --arg value 'alpn="h3,h2" port="8443" ipv4hint=198.51.100.9 ipv6hint=2001:db8::1' \
-                    '{success:true, result:[{id:"H1", type:"HTTPS", ttl:3600, data:{priority:3, target:"svc6.example.com", value:$value}}], result_info:{count:1, total_count:1, total_pages:1}}'
+                jq -nc --arg value 'alpn="h3,h2" port="8443" ipv4hint=8.8.8.9 ipv6hint=2606:4700:4700::1' \
+                    '{success:true, errors:[], result:[{id:"H1", type:"HTTPS", ttl:3600, data:{priority:3, target:"svc6.example.com", value:$value}}], result_info:{count:1, total_count:1, total_pages:1}}'
             else
                 records_response 0 '[]'
             fi
             ;;
         https_ttl_only)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
             else
-                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=198.51.100.42 ipv6hint=2001:db8::1' 120)]"
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=8.8.8.42 ipv6hint=2606:4700:4700::1' 120)]"
             fi
             ;;
         https_escape)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.1 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.1 false 3600)]"
             else
-                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" key654="a\\b" ipv4hint=198.51.100.1' 3600)]"
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" key654="a\\b" ipv4hint=8.8.8.1' 3600)]"
             fi
             ;;
-        batch_all|batch_failure|batch_timeout|batch_count_mismatch|batch_success_errors)
+        batch_all|batch_failure|batch_timeout|batch_count_mismatch|batch_success_errors|batch_missing_errors)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.1 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.1 false 3600)]"
             elif [[ "$type" == AAAA ]]; then
-                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+                records_response 1 "[$(json_record AAAA1 2606:4700:4700::1 false 3600)]"
             else
-                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=198.51.100.1 ipv6hint=2001:db8::1' 3600)]"
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=8.8.8.1 ipv6hint=2606:4700:4700::1' 3600)]"
             fi
             ;;
         only_aaaa)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
             elif [[ "$type" == AAAA ]]; then
-                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+                records_response 1 "[$(json_record AAAA1 2606:4700:4700::1 false 3600)]"
             else
-                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=198.51.100.42 ipv6hint=2001:db8::42' 3600)]"
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=8.8.8.42 ipv6hint=2606:4700:4700::42' 3600)]"
             fi
             ;;
         no_change|no_change_hc_fail)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
             elif [[ "$type" == AAAA ]]; then
-                records_response 1 "[$(json_record AAAA1 2001:db8::42 false 3600)]"
+                records_response 1 "[$(json_record AAAA1 2606:4700:4700::42 false 3600)]"
             else
-                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=198.51.100.42 ipv6hint=2001:db8::42' 3600)]"
+                records_response 1 "[$(json_https_record H1 'alpn="h3,h2" ipv4hint=8.8.8.42 ipv6hint=2606:4700:4700::42' 3600)]"
             fi
             ;;
         mixed_create_update)
             if [[ "$type" == A ]]; then
                 records_response 0 '[]'
             else
-                records_response 1 "[$(json_record AAAA1 2001:db8::1 false 3600)]"
+                records_response 1 "[$(json_record AAAA1 2606:4700:4700::1 false 3600)]"
             fi
             ;;
         duplicate_https)
             if [[ "$type" == A ]]; then
-                records_response 1 "[$(json_record A1 198.51.100.42 false 3600)]"
+                records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
             else
                 records_response 2 "[$(json_https_record H1 'alpn="h3"' 3600),$(json_https_record H2 'alpn="h2"' 3600)]"
             fi
@@ -293,8 +343,13 @@ if [[ "$method" == POST && "$url" == */dns_records/batch ]]; then
             '{success:true,errors:[{code:1001,message:"operation warning fixture"}],result:{patches:[$request.patches[]? | {id:.id}],posts:[$request.posts[]? | {id:"created"}]}}'
         exit 0
     fi
+    if [[ "${TEST_SCENARIO:-}" == batch_missing_errors ]]; then
+        jq -nc --argjson request "$data" \
+            '{success:true,result:{patches:[$request.patches[]? | {id:.id}],posts:[$request.posts[]? | {id:"created"}]}}'
+        exit 0
+    fi
     jq -nc --argjson request "$data" \
-        '{success:true,result:{patches:[$request.patches[]? | {id:.id}],posts:[$request.posts[]? | {id:"created"}]}}'
+        '{success:true,errors:[],result:{patches:[$request.patches[]? | {id:.id}],posts:[$request.posts[]? | {id:"created"}]}}'
     exit 0
 fi
 
@@ -311,11 +366,12 @@ if [[ "${TEST_SCENARIO:-}" == ipv4_ambiguous ]]; then
 elif [[ "$*" == *" -4 "* || "$1" == "-j" && "$2" == "-4" ]]; then
     printf '[{"addr_info":[{"family":"inet","local":"8.8.4.4","scope":"global","flags":[]}]}]\n'
 elif [[ "${TEST_SCENARIO:-}" == ipv6_tie ]]; then
-    printf '[{"addr_info":[{"family":"inet6","local":"2001:db8::42","scope":"global","flags":[],"preferred_life_time":1800},{"family":"inet6","local":"2001:db8::43","scope":"global","flags":[],"preferred_life_time":1800}]}]\n'
-elif [[ "${TEST_SCENARIO:-}" == ipv6_longest || "${TEST_SCENARIO:-}" == ipv6_published ]]; then
-    printf '[{"addr_info":[{"family":"inet6","local":"2001:db8::42","scope":"global","flags":[],"preferred_life_time":1800},{"family":"inet6","local":"2001:db8::43","scope":"global","flags":[],"preferred_life_time":3600}]}]\n'
+    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::42","scope":"global","flags":[],"preferred_life_time":1800},{"family":"inet6","local":"2606:4700:4700::43","scope":"global","flags":[],"preferred_life_time":1800}]}]\n'
+elif [[ "${TEST_SCENARIO:-}" == ipv6_longest || "${TEST_SCENARIO:-}" == ipv6_published ||
+        "${TEST_SCENARIO:-}" == ipv6_fallback_equivalent ]]; then
+    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::42","scope":"global","flags":[],"preferred_life_time":1800},{"family":"inet6","local":"2606:4700:4700::43","scope":"global","flags":[],"preferred_life_time":3600}]}]\n'
 else
-    printf '[{"addr_info":[{"family":"inet6","local":"2001:db8::dead","scope":"global","flags":["temporary"],"preferred_life_time":3600},{"family":"inet6","local":"2001:db8::bad","scope":"global","flags":["deprecated"],"preferred_life_time":7200},{"family":"inet6","local":"2001:db8::42","scope":"global","flags":[],"preferred_life_time":1800}]}]\n'
+    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::dead","scope":"global","flags":["temporary"],"preferred_life_time":3600},{"family":"inet6","local":"2606:4700:4700::bad","scope":"global","flags":["deprecated"],"preferred_life_time":7200},{"family":"inet6","local":"2606:4700:4700::42","scope":"global","flags":[],"preferred_life_time":1800}]}]\n'
 fi
 EOF
 
@@ -359,7 +415,8 @@ run_script() {
     local zone_id="${RUN_ZONE_ID:-0123456789abcdef0123456789abcdef}"
     local api_token="${RUN_API_TOKEN:-test-token}"
     mkdir -p "$runtime_dir"
-    [[ "$scenario" == ipv6_iface || "$scenario" == ipv6_tie || "$scenario" == ipv6_longest || "$scenario" == ipv6_published ]] && ipv6_iface="eth0"
+    [[ "$scenario" == ipv6_iface || "$scenario" == ipv6_tie || "$scenario" == ipv6_longest ||
+       "$scenario" == ipv6_published || "$scenario" == ipv6_fallback_equivalent ]] && ipv6_iface="eth0"
     [[ "$scenario" == ipv4_iface || "$scenario" == ipv4_mismatch || "$scenario" == ipv4_ambiguous ]] && ipv4_iface="wan"
     [[ "$scenario" == no_change || "$scenario" == no_change_hc_fail ]] && { a_hc="http://hc.example/a-secret"; aaaa_hc="http://hc.example/aaaa-secret"; }
     PATH="$MOCKBIN:$PATH" \
@@ -371,8 +428,8 @@ run_script() {
     CLOUDFLARE_ZONE_ID="$zone_id" \
     A_HC="$a_hc" \
     AAAA_HC="$aaaa_hc" \
-    CLOUDFLARE_DDNS_A_SOURCE="${ipv4_iface:+interface:$ipv4_iface}" \
-    CLOUDFLARE_DDNS_AAAA_SOURCE="${ipv6_iface:+interface:$ipv6_iface}" \
+    CLOUDFLARE_DDNS_A_SOURCE="${RUN_A_SOURCE:-${ipv4_iface:+interface:$ipv4_iface}}" \
+    CLOUDFLARE_DDNS_AAAA_SOURCE="${RUN_AAAA_SOURCE:-${ipv6_iface:+interface:$ipv6_iface}}" \
     RUNTIME_DIRECTORY="$runtime_dir" \
         "$SCRIPT" "$@" >"$output" 2>&1
 }
@@ -427,9 +484,11 @@ post_line=$(grep 'method=POST' "$CURL_LOG")
 [[ "$post_line" != *"--retry"* ]] || fail "POST curl command included --retry"
 [[ "$post_line" == *'/dns_records/batch'* ]] || fail "creation did not use batch endpoint"
 assert_contains "$CURL_LOG" "raw=-q"
+assert_contains "$CURL_LOG" "--output"
+assert_not_contains "$CURL_LOG" "--retry-all-errors"
 assert_not_contains "$CURL_LOG" "Authorization: Bearer test-token"
 assert_contains "$SENDMAIL_LOG" "Cloudflare DDNS for example.com updated"
-assert_contains "$SENDMAIL_LOG" "Created A record for example.com: 198.51.100.42"
+assert_contains "$SENDMAIL_LOG" "Created A record for example.com: 8.8.8.42"
 
 reset_logs
 credentials_output="$TEST_TMP/systemd credentials are supported.out"
@@ -452,6 +511,14 @@ assert_not_contains "$CURL_LOG" "/dns_records/batch"
 expect_failure "malformed API JSON is rejected" malformed_api -4 example.com
 assert_contains "$TEST_TMP/malformed API JSON is rejected.out" "Cloudflare API error"
 
+expect_failure "missing list result is rejected" missing_result -4 example.com
+assert_contains "$TEST_TMP/missing list result is rejected.out" "invalid list A records response"
+assert_not_contains "$CURL_LOG" "/dns_records/batch"
+
+expect_failure "string success flag is rejected" string_success -4 example.com
+assert_contains "$TEST_TMP/string success flag is rejected.out" "Cloudflare API error"
+assert_not_contains "$CURL_LOG" "/dns_records/batch"
+
 expect_failure "duplicate count uses filtered result length" duplicate -4 example.com
 assert_contains "$TEST_TMP/duplicate count uses filtered result length.out" "Found 2 A records"
 assert_not_contains "$CURL_LOG" "method=PATCH"
@@ -466,27 +533,40 @@ expect_success "broad total_count does not cause duplicate failure" broad_total_
 assert_not_contains "$CURL_LOG" "method=PATCH"
 assert_not_contains "$CURL_LOG" "method=POST"
 
+expect_success "retried GET output is isolated" retry_then_success -4 example.com
+assert_contains "$CURL_LOG" "--output"
+assert_not_contains "$CURL_LOG" "/dns_records/batch"
+
 expect_success "TTL 60 is accepted and patched" ttl60 -4 -t 60 example.com
 patch_line=$(grep '/dns_records/batch' "$CURL_LOG")
 [[ "$patch_line" == *'"ttl":60'* ]] || fail "PATCH payload did not set ttl 60"
 [[ "$patch_line" == *'"proxied":false'* ]] || fail "PATCH payload did not disable proxying"
-assert_not_contains "$CURL_LOG" '"content":"198.51.100.42"'
+assert_not_contains "$CURL_LOG" '"content":"8.8.8.42"'
 
 expect_success "proxied-only drift patches only proxy state" proxied_only -4 example.com
 patch_line=$(grep '/dns_records/batch' "$CURL_LOG")
 [[ "$patch_line" == *'"patches":[{"id":"A1","proxied":false}]'* ]] || fail "proxied-only patch was not minimal"
 
 expect_success "invalid provider output falls back" invalid_provider_fallback -4 example.com
-assert_contains "$TEST_TMP/invalid provider output falls back.out" "Current IPv4 is 198.51.100.43"
+assert_contains "$TEST_TMP/invalid provider output falls back.out" "Current IPv4 is 8.8.8.43"
 
 expect_success "invalid IPv6 provider output falls back" invalid_provider_fallback -6 example.com
-assert_contains "$TEST_TMP/invalid IPv6 provider output falls back.out" "Current IPv6 is 2001:db8::43"
+assert_contains "$TEST_TMP/invalid IPv6 provider output falls back.out" "Current IPv6 is 2606:4700:4700::43"
+
+expect_failure "non-public provider addresses are rejected" private_provider -4 example.com
+assert_contains "$TEST_TMP/non-public provider addresses are rejected.out" "Failed to determine external IP"
+[[ $(grep -Ec 'cdn-cgi|icanhazip|ifconfig.co' "$CURL_LOG") -eq 3 ]] || fail "did not try every IP provider"
+assert_not_contains "$CURL_LOG" "/dns_records/batch"
+
+expect_failure "non-public IPv6 provider addresses are rejected" private_provider -6 example.com
+assert_contains "$TEST_TMP/non-public IPv6 provider addresses are rejected.out" "Failed to determine external IP"
+assert_not_contains "$CURL_LOG" "/dns_records/batch"
 
 expect_success "record is lowercased and queried exactly" lowercase -4 Example.COM.
 assert_contains "$CURL_LOG" "name_exact=example.com"
 
 expect_success "interface IPv6 skips unstable addresses" ipv6_iface -6 example.com
-assert_contains "$TEST_TMP/interface IPv6 skips unstable addresses.out" "Current IPv6 is 2001:db8::42"
+assert_contains "$TEST_TMP/interface IPv6 skips unstable addresses.out" "Current IPv6 is 2606:4700:4700::42"
 assert_contains "$IP_LOG" "-j -6 addr show dev eth0"
 
 expect_success "interface IPv4 is selected and source-bound verified" ipv4_iface -4 example.com
@@ -507,25 +587,29 @@ expect_failure "equal-lifetime IPv6 candidates fail closed" ipv6_tie -6 example.
 assert_contains "$TEST_TMP/equal-lifetime IPv6 candidates fail closed.out" "equally preferred"
 
 expect_success "longest-lived IPv6 candidate is selected" ipv6_longest -6 example.com
-assert_contains "$TEST_TMP/longest-lived IPv6 candidate is selected.out" "Current IPv6 is 2001:db8::43"
+assert_contains "$TEST_TMP/longest-lived IPv6 candidate is selected.out" "Current IPv6 is 2606:4700:4700::43"
 
 expect_success "published preferred IPv6 wins over longer lifetime" ipv6_published -6 example.com
-assert_contains "$TEST_TMP/published preferred IPv6 wins over longer lifetime.out" "Current IPv6 is 2001:db8::42"
+assert_contains "$TEST_TMP/published preferred IPv6 wins over longer lifetime.out" "Current IPv6 is 2606:4700:4700::42"
 assert_not_contains "$CURL_LOG" "/dns_records/batch"
+
+expect_success "IPv6 fallback excludes equivalent published form" ipv6_fallback_equivalent -6 example.com
+assert_contains "$TEST_TMP/IPv6 fallback excludes equivalent published form.out" "Current IPv6 is 2606:4700:4700::43"
+assert_contains "$CURL_LOG" '"content":"2606:4700:4700::43"'
 
 expect_success "HTTPS update preserves unrelated SvcParams" https_preserve -4 -s example.com
 https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
 [[ "$https_patch" == *'port=\"8443\"'* ]] || fail "HTTPS payload did not preserve port"
 [[ "$https_patch" == *'ech=\"abc\"'* ]] || fail "HTTPS payload did not preserve ech"
-[[ "$https_patch" == *'ipv4hint=\"198.51.100.42\"'* ]] || fail "HTTPS payload did not refresh ipv4hint"
-[[ "$https_patch" == *'ipv6hint=\"2001:db8::1\"'* ]] || fail "HTTPS payload did not preserve ipv6hint"
+[[ "$https_patch" == *'ipv4hint=\"8.8.8.42\"'* ]] || fail "HTTPS payload did not refresh ipv4hint"
+[[ "$https_patch" == *'ipv6hint=\"2606:4700:4700::1\"'* ]] || fail "HTTPS payload did not preserve ipv6hint"
 [[ "$https_patch" == *'"priority":2'* ]] || fail "HTTPS payload did not preserve priority"
 [[ "$https_patch" == *'"target":"svc.example.com"'* ]] || fail "HTTPS payload did not preserve target"
 
 expect_success "IPv6-only HTTPS update preserves IPv4 hint" https_preserve_v6 -6 -s example.com
 https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
-[[ "$https_patch" == *'ipv4hint=\"198.51.100.9\"'* ]] || fail "HTTPS payload did not preserve ipv4hint"
-[[ "$https_patch" == *'ipv6hint=\"2001:db8::42\"'* ]] || fail "HTTPS payload did not refresh ipv6hint"
+[[ "$https_patch" == *'ipv4hint=\"8.8.8.9\"'* ]] || fail "HTTPS payload did not preserve ipv4hint"
+[[ "$https_patch" == *'ipv6hint=\"2606:4700:4700::42\"'* ]] || fail "HTTPS payload did not refresh ipv6hint"
 
 expect_success "HTTPS TTL-only patch omits data" https_ttl_only -4 -s example.com
 https_patch=$(grep '/dns_records/batch' "$CURL_LOG")
@@ -550,6 +634,8 @@ expect_success "no changes skips batch and pings healthchecks" no_change -s exam
 assert_not_contains "$CURL_LOG" "/dns_records/batch"
 assert_contains "$CURL_LOG" "http://hc.example/a"
 assert_contains "$CURL_LOG" "http://hc.example/aaaa"
+hc_line=$(grep 'url=http://hc.example/a-secret ' "$CURL_LOG")
+[[ "$hc_line" == *'--retry 1'* && "$hc_line" != *'--retry 5'* ]] || fail "healthcheck did not use the short retry profile"
 
 expect_success "missing A and changed AAAA share one batch" mixed_create_update example.com
 batch_line=$(grep '/dns_records/batch' "$CURL_LOG")
@@ -575,6 +661,9 @@ assert_contains "$TEST_TMP/batch count mismatch is rejected.out" "did not accoun
 expect_failure "batch success with errors is rejected" batch_success_errors -s example.com
 assert_contains "$TEST_TMP/batch success with errors is rejected.out" "operation warning fixture"
 
+expect_failure "batch response without errors array is rejected" batch_missing_errors -s example.com
+assert_contains "$TEST_TMP/batch response without errors array is rejected.out" "invalid DNS batch response"
+
 expect_success "healthcheck delivery failure is nonfatal and redacted" no_change_hc_fail -s example.com
 assert_contains "$TEST_TMP/healthcheck delivery failure is nonfatal and redacted.out" "A healthcheck ping failed"
 assert_not_contains "$TEST_TMP/healthcheck delivery failure is nonfatal and redacted.out" "a-secret"
@@ -587,6 +676,14 @@ fi
 assert_contains "$invalid_credential_output" "32-character hexadecimal"
 assert_not_contains "$CURL_LOG" "https://api.cloudflare.com"
 printf 'ok - invalid zone id is rejected before API calls\n'
+
+RUN_AAAA_SOURCE=invalid
+expect_success "unused family source is ignored" lowercase -4 example.com
+[[ ! -s "$IP_LOG" ]] || fail "unused AAAA interface policy invoked ip"
+unset RUN_AAAA_SOURCE
+
+expect_failure "extra positional arguments are rejected" lowercase -4 example.com extra
+[[ ! -s "$CURL_LOG" ]] || fail "extra arguments reached curl"
 
 unsafe_token_output="$TEST_TMP/unsafe token.out"
 reset_logs

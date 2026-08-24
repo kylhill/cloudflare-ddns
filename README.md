@@ -15,7 +15,7 @@ Options:
   -6  Only update AAAA record with external IPv6 address
 ```
 
-## Required variables
+## Configuration variables
 
 | Variable                | Purpose                                       |
 | ----------------------- | --------------------------------------------- |
@@ -48,9 +48,17 @@ AAAA, and HTTPS changes, and submits them through one Cloudflare DNS batch
 request. If nothing changed, it skips the batch request. A lost batch response
 is not retried automatically because the outcome may be ambiguous.
 
+The batch is transactional in Cloudflare's database, but propagation through
+Cloudflare's distributed DNS network is not atomic. Resolvers can temporarily
+observe a mixture of old and new A, AAAA, and HTTPS data after a successful
+update.
+
 ## Dependencies
 
-- `bash`, `curl`, `jq`, `flock`, `awk`, `tr`
+- Bash 4 or newer
+- curl 7.76 or newer, `jq`, and `flock`
+- Standard system utilities: `awk`, `tr`, `mktemp`, `chmod`, `rm`, `head`,
+  `hostname`, and `date`
 - `ip` when either address source uses `interface:<name>`
 - `sendmail` (optional; used to email a per-run change summary to `root`)
 

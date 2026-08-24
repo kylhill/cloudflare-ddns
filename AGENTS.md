@@ -6,7 +6,9 @@ Single-file Bash script (`cloudflare-ddns.sh`) that updates Cloudflare DNS `A`, 
 
 ## Dependencies
 
-Runtime: `bash`, `curl`, `jq`, `flock`, `awk`, `tr`. Optional: `sendmail`.
+Runtime: Bash 4+, curl 7.76+, `jq`, `flock`, and standard system utilities
+(`awk`, `tr`, `mktemp`, `chmod`, `rm`, `head`, `hostname`, `date`). Optional:
+`sendmail`.
 
 `ip` is required only when `CLOUDFLARE_DDNS_A_SOURCE` or
 `CLOUDFLARE_DDNS_AAAA_SOURCE` uses `interface:<name>`.
@@ -35,9 +37,10 @@ The harness covers:
 - interface-derived IPv6 filtering
 - HTTPS SvcParams, priority, and target preservation while refreshing address hints
 - mixed batch POST/PATCH operations, no-op runs, batch failures, and partial-family hint preservation
-- HTTP-200 API error envelopes, malformed JSON, and inconsistent batch responses
+- HTTP-200 API error envelopes, malformed/structurally invalid JSON, retry-output isolation, and inconsistent batch responses
 - canonical IPv6 comparison and deterministic interface address selection
-- credential validation, auth-file permissions/cleanup, failure mail, and healthcheck URL redaction
+- globally routable provider output, inactive-family source handling, and canonical fallback exclusion
+- credential validation, auth-file permissions/cleanup, change mail, and healthcheck URL redaction
 
 ## Architecture
 
@@ -51,16 +54,19 @@ The script is a single linear flow:
 6. **IP detection** (`query_external_ip -4|-6` or interface selection) — discovers and validates every requested address
 7. **Batch planning** — builds one plan containing minimal `patches`, complete `posts`, and reporting metadata without mutating Cloudflare
 8. **Batch submission** — sends at most one non-retried `POST /dns_records/batch`, then validates the complete response before reporting success
-9. **Exit trap** — pings `/fail` on Healthchecks.io for any attempted-but-failed family; emails `root` via `sendmail` for changes or failures
+9. **Exit trap** — pings `/fail` on Healthchecks.io for any attempted-but-failed family; emails `root` via `sendmail` for completed changes
 
 ## Key Conventions
 
-**Curl profiles** — Three named curl arrays with deliberately different retry policies:
+**Curl profiles** — Four named curl arrays with deliberately different retry policies:
 - `CURL_GET`: 5 retries (idempotent)
 - `CURL_POST`: no retries (the batch outcome can be ambiguous if its response is lost)
 - `CURL_IP`: tight timeouts, 1 retry (fallback loop handles the rest)
+- `CURL_HC`: tight timeouts, 1 retry (monitoring is best-effort)
 
 All curl profiles use `-q` to ignore user/global curl config files.
+Response-bearing retried requests write to a regular temporary file so curl can
+reset output between attempts; never capture retried curl stdout directly.
 
 **Single batch mutation** — planners must never call Cloudflare mutation endpoints. All required changes go into one `patches`/`posts` payload sent through the DNS batch endpoint.
 

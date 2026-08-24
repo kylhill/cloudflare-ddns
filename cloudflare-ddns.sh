@@ -28,7 +28,7 @@ IPV4=""
 IPV6=""
 A_STATUS=disabled
 AAAA_STATUS=disabled
-USER_AGENT="cloudflare-ddns/2.4"
+USER_AGENT="cloudflare-ddns/2.5"
 
 CF_API="https://api.cloudflare.com/client/v4"
 CF_AUTH_CONFIG=""
@@ -46,8 +46,9 @@ CURL_BASE=(
     --connect-timeout 5
     --max-time 15
 )
-# Read-only / idempotent requests can retry liberally
-CURL_GET=("${CURL_BASE[@]}" --retry 5 --retry-delay 2 --retry-max-time 30 --retry-all-errors)
+# Read-only / idempotent requests retry transient failures. Response-bearing
+# calls write to a regular temporary file so curl can reset it between retries.
+CURL_GET=("${CURL_BASE[@]}" --retry 5 --retry-delay 2 --retry-max-time 30 --retry-connrefused)
 # The DNS batch POST is not retried because a lost response leaves its outcome
 # ambiguous even though the database operation may have completed.
 CURL_POST=("${CURL_BASE[@]}")
@@ -56,6 +57,12 @@ CURL_IP=(
     curl -q -sS --fail-with-body -A "$USER_AGENT"
     --connect-timeout 3 --max-time 5
     --retry 1 --retry-delay 1
+)
+# Monitoring is best-effort and should not significantly delay service exit.
+CURL_HC=(
+    curl -q -sS --fail-with-body -A "$USER_AGENT"
+    --connect-timeout 3 --max-time 5
+    --retry 1 --retry-delay 1 --retry-connrefused
 )
 
 # Color escapes only when stdout is a TTY
@@ -223,12 +230,46 @@ valid_ipv6() {
     return 0
 }
 
-valid_ip_for_family() {
+public_ipv6() {
+    local normal first second
+    normal=$(canonical_ipv6 "$1") || return 1
+    # Be conservative about special-purpose ranges within 2000::/3. The
+    # excluded IETF block contains a few narrowly scoped anycast exceptions,
+    # but those are not usable host interface addresses for DDNS.
+    [[ "$normal" =~ ^[23] ]] || return 1
+    IFS=: read -r first second _ <<<"$normal"
+    if [[ "$first" == 2001 ]]; then
+        (( 16#$second > 0x01ff )) || return 1
+        [[ "$second" != 0db8 ]] || return 1
+    fi
+    [[ "$first" != 2002 ]] || return 1
+    if [[ "$first" == 3fff ]]; then
+        (( 16#$second > 0x0fff )) || return 1
+    fi
+}
+
+public_ip_for_family() {
     case "$1" in
-        -4) valid_ipv4 "$2" ;;
-        -6) valid_ipv6 "$2" ;;
+        -4) public_ipv4 "$2" ;;
+        -6) public_ipv6 "$2" ;;
         *) return 1 ;;
     esac
+}
+
+# Capture a response in a regular file. curl can truncate a regular output file
+# before a retry; stdout captured through a pipe cannot be reset safely.
+capture_curl_response() {
+    local destination="$1" response_file rc
+    shift
+    response_file=$(mktemp "$STATE_DIR/curl-response.XXXXXX") || return 1
+    if "$@" --output "$response_file"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    printf -v "$destination" '%s' "$(<"$response_file")"
+    rm -f -- "$response_file"
+    return "$rc"
 }
 
 # Query an externally observed IP, optionally binding to an exact source IP.
@@ -244,8 +285,8 @@ query_external_ip() {
         "https://icanhazip.com" \
         "https://ifconfig.co"
     do
-        if ! ip=$("${CURL_IP[@]}" "$family" "${bind_args[@]}" "$url" 2>&1); then
-            last_err="$ip"
+        if ! capture_curl_response ip "${CURL_IP[@]}" "$family" "${bind_args[@]}" "$url"; then
+            last_err="request to $url failed"
             continue
         fi
         if [[ "$url" == *cdn-cgi/trace* ]]; then
@@ -253,7 +294,7 @@ query_external_ip() {
         else
             ip=$(printf '%s' "$ip" | tr -d '[:space:]')
         fi
-        if valid_ip_for_family "$family" "$ip"; then
+        if public_ip_for_family "$family" "$ip"; then
             printf '%s' "$ip"
             return 0
         fi
@@ -285,6 +326,7 @@ public_ipv4() {
     (( !(a == 100 && b >= 64 && b <= 127) )) || return 1
     (( !(a == 169 && b == 254) && !(a == 172 && b >= 16 && b <= 31) )) || return 1
     (( !(a == 192 && b == 168) && !(a == 192 && b == 0 && (c == 0 || c == 2)) )) || return 1
+    (( !(a == 192 && b == 88 && c == 99) )) || return 1
     (( !(a == 198 && (b == 18 || b == 19 || b == 51 && c == 100)) )) || return 1
     (( !(a == 203 && b == 0 && c == 113) )) || return 1
     return 0
@@ -309,8 +351,10 @@ select_interface_ipv6() {
     local -a addresses=() lifetimes=()
     json=$(ip -j -6 addr show dev "$iface") || { err "Failed to read IPv6 addresses from interface $iface"; return 1; }
     while IFS=$'\t' read -r addr lifetime; do
-        [[ "$addr" =~ ^[23] ]] || continue
-        [[ -n "$excluded" && "$addr" == "$excluded" ]] && continue
+        public_ipv6 "$addr" || continue
+        if [[ -n "$excluded" ]] && addresses_equal -6 "$addr" "$excluded"; then
+            continue
+        fi
         addresses+=("$addr"); lifetimes+=("$lifetime")
     done < <(jq -r '.[]?.addr_info[]? | select(.family == "inet6" and .scope == "global") | select(((.flags // []) | index("temporary") | not) and ((.flags // []) | index("tentative") | not) and ((.flags // []) | index("dadfailed") | not) and ((.flags // []) | index("deprecated") | not)) | [.local, (.preferred_life_time // 0 | tostring)] | @tsv' <<<"$json")
     ((${#addresses[@]} > 0)) || { err "No stable public global IPv6 address found on interface $iface"; return 1; }
@@ -329,12 +373,10 @@ select_interface_ipv6() {
     printf '%s' "${addresses[best]}"
 }
 
-# Verify a Cloudflare API JSON response has success:true; on failure, print errors and exit.
+# Verify a Cloudflare API JSON response has success:true; on failure, print errors.
 check_success() {
     local body="$1" context="$2"
-    local ok
-    ok=$(jq -r '.success // false' <<<"$body" 2>/dev/null || echo false)
-    if [[ "$ok" != "true" ]]; then
+    if ! jq -e '.success == true' <<<"$body" >/dev/null 2>&1; then
         err "Cloudflare API error during $context:"
         if ! jq -e '.errors // empty' <<<"$body" >/dev/null 2>&1; then
             # Non-JSON (e.g. HTML 502 page from a proxy); truncate to keep logs readable
@@ -346,15 +388,15 @@ check_success() {
     fi
 }
 
-# Usage: cf_api_get  PATH [QUERY_KEY=VAL ...]
+# Usage: cf_api_get DESTINATION_VAR PATH [QUERY_KEY=VAL ...]
 cf_api_get() {
-    local path="$1"; shift
+    local destination="$1" path="$2"; shift 2
     local args=(-G)
     local kv
     for kv in "$@"; do
         args+=(--data-urlencode "$kv")
     done
-    "${CURL_GET[@]}" \
+    capture_curl_response "$destination" "${CURL_GET[@]}" \
         --config "$CF_AUTH_CONFIG" \
         -H "Content-Type: application/json" \
         "${args[@]}" \
@@ -408,13 +450,35 @@ validate_credentials() {
 
 get_records_checked() {
     local type="$1" body pages count
-    body=$(cf_api_get "/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
-        "type=$type" "name.exact=$RECORD" "page=1" "per_page=100") || {
+    if ! cf_api_get body "/zones/$CLOUDFLARE_ZONE_ID/dns_records" \
+        "type=$type" "name.exact=$RECORD" "page=1" "per_page=100"; then
         err "Cloudflare API request failed while listing $type records:"
         [[ -n "$body" ]] && printf '%s\n' "$body" >&2
         return 1
-    }
+    fi
     check_success "$body" "list $type records" || return 1
+    if ! jq -e --arg type "$type" '
+        (.result | type == "array") and
+        (.errors | type == "array" and length == 0) and
+        (.result_info | type == "object") and
+        ((.result_info.total_pages // 1) |
+            type == "number" and . >= 1 and floor == .) and
+        all(.result[];
+            (.id | type == "string" and length > 0) and
+            (.ttl | type == "number") and
+            (if $type == "HTTPS" then
+                (.data | type == "object") and
+                (.data.priority | type == "number") and
+                (.data.target | type == "string") and
+                (.data.value | type == "string")
+             else
+                (.content | type == "string") and
+                (.proxied | type == "boolean")
+             end))
+    ' <<<"$body" >/dev/null; then
+        err "Cloudflare API returned an invalid list $type records response"
+        return 1
+    fi
     { read -r pages; read -r count; } < <(
         jq -r '[.result_info.total_pages // 1, (.result | length)] | .[]' <<<"$body"
     )
@@ -457,17 +521,18 @@ parse_https_record() {
 }
 
 append_plan_operation() {
-    local collection="$1" operation="$2" output="$3" notification="$4" family="$5"
+    local collection="$1" operation="$2" output="$3" notification="$4"
     PLAN_JSON=$(jq -c \
         --arg collection "$collection" --argjson operation "$operation" \
-        --arg output "$output" --arg notification "$notification" --arg family "$family" \
+        --arg output "$output" --arg notification "$notification" \
         '.[$collection] += [$operation] |
-         .messages += [{console:$output, notification:$notification, family:$family}]' <<<"$PLAN_JSON")
+         .messages += [{console:$output, notification:$notification}]' <<<"$PLAN_JSON")
 }
 
 plan_host_record() {
     local type="$1" ip="$2" response="$3"
-    local cf_id cf_ip cf_proxied cf_ttl data message output family content_changed=false
+    local cf_id cf_ip cf_proxied cf_ttl data message output family
+    local content_changed=false ttl_changed=false proxy_changed=false
     { read -r cf_id; read -r cf_ip; read -r cf_proxied; read -r cf_ttl; } < <(parse_record "$response")
     [[ "$type" == A ]] && family=-4 || family=-6
     if [[ -n "$cf_id" ]] && ! addresses_equal "$family" "$ip" "$cf_ip"; then
@@ -479,12 +544,18 @@ plan_host_record() {
             --argjson ttl "$TTL" '{type:$type, name:$name, content:$ip, ttl:$ttl, proxied:false}')
         output="Created new $type record for $RECORD, $ip"
         message="Created $type record for $RECORD: $ip"
-        append_plan_operation posts "$data" "$output" "$message" "$type"
+        append_plan_operation posts "$data" "$output" "$message"
     elif [[ "$content_changed" == true || "$cf_ttl" != "$TTL" || "$cf_proxied" != false ]]; then
-        data=$(jq -nc --arg id "$cf_id" '{id:$id}')
-        [[ "$content_changed" == true ]] && data=$(jq -c --arg value "$ip" '.content=$value' <<<"$data")
-        [[ "$cf_ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
-        [[ "$cf_proxied" != false ]] && data=$(jq -c '.proxied=false' <<<"$data")
+        [[ "$cf_ttl" != "$TTL" ]] && ttl_changed=true
+        [[ "$cf_proxied" != false ]] && proxy_changed=true
+        data=$(jq -nc --arg id "$cf_id" --arg ip "$ip" --argjson ttl "$TTL" \
+            --argjson content_changed "$content_changed" \
+            --argjson ttl_changed "$ttl_changed" --argjson proxy_changed "$proxy_changed" '
+                {id:$id} +
+                (if $content_changed then {content:$ip} else {} end) +
+                (if $ttl_changed then {ttl:$ttl} else {} end) +
+                (if $proxy_changed then {proxied:false} else {} end)
+            ')
         if [[ "$content_changed" == true ]]; then
             output="Updated $type record for $RECORD from $cf_ip to $ip"
             message="Updated $type record for $RECORD: $cf_ip -> $ip"
@@ -495,7 +566,7 @@ plan_host_record() {
             output="Disabled Cloudflare proxying for $type record $RECORD"
             message="Disabled proxying for $type record $RECORD"
         fi
-        append_plan_operation patches "$data" "$output" "$message" "$type"
+        append_plan_operation patches "$data" "$output" "$message"
     else
         qprint "${C_YELLOW}No change to $type record for $RECORD, $cf_ip${C_RESET}"
         return 0
@@ -564,7 +635,7 @@ transform_https_hints() {
 plan_https_record() {
     local ipv4="$1" ipv6="$2" response="$3"
     local id value priority target ttl old4 old6 new_value data output message transformed
-    local ipv4_changed=false ipv6_changed=false
+    local ipv4_changed=false ipv6_changed=false hints_changed=false ttl_changed=false
     { read -r id; read -r value; read -r priority; read -r target; read -r ttl; } < <(parse_https_record "$response")
     transformed=$(transform_https_hints "$value" "$ipv4" "$ipv6") || return 1
     { read -r old4; read -r old6; read -r ipv4; read -r ipv6; read -r new_value; } <<<"$transformed"
@@ -578,17 +649,22 @@ plan_https_record() {
               data:{priority:1, target:".", value:$value}}')
         output="Created new HTTPS record for $RECORD"
         message="Created HTTPS record for $RECORD"
-        append_plan_operation posts "$data" "$output" "$message" HTTPS
+        append_plan_operation posts "$data" "$output" "$message"
     elif [[ "$ipv4_changed" == true || "$ipv6_changed" == true || "$ttl" != "$TTL" ]]; then
-        data=$(jq -nc --arg id "$id" '{id:$id}')
-        if [[ "$ipv4_changed" == true || "$ipv6_changed" == true ]]; then
-            data=$(jq -c --arg value "$new_value" --arg target "$target" --argjson priority "$priority" \
-                '.data={priority:$priority,target:$target,value:$value}' <<<"$data")
-        fi
-        [[ "$ttl" != "$TTL" ]] && data=$(jq -c --argjson value "$TTL" '.ttl=$value' <<<"$data")
+        [[ "$ipv4_changed" == true || "$ipv6_changed" == true ]] && hints_changed=true
+        [[ "$ttl" != "$TTL" ]] && ttl_changed=true
+        data=$(jq -nc --arg id "$id" --arg value "$new_value" --arg target "$target" \
+            --argjson priority "$priority" --argjson desired_ttl "$TTL" \
+            --argjson hints_changed "$hints_changed" --argjson ttl_changed "$ttl_changed" '
+                {id:$id} +
+                (if $hints_changed then
+                    {data:{priority:$priority,target:$target,value:$value}}
+                 else {} end) +
+                (if $ttl_changed then {ttl:$desired_ttl} else {} end)
+            ')
         output="Updated HTTPS record for $RECORD"
         message="Updated HTTPS record for $RECORD (ipv4hint=$ipv4 ipv6hint=$ipv6)"
-        append_plan_operation patches "$data" "$output" "$message" HTTPS
+        append_plan_operation patches "$data" "$output" "$message"
     else
         qprint "${C_YELLOW}No change to HTTPS record for $RECORD${C_RESET}"
         return 0
@@ -599,7 +675,7 @@ ping_hc() {
     local family="$1" url="$2"
     [[ -z "$url" ]] && return 0
     # Monitoring delivery is best-effort after DNS reconciliation succeeds.
-    "${CURL_GET[@]}" -o /dev/null "$url" || err "$family healthcheck ping failed"
+    "${CURL_HC[@]}" -o /dev/null "$url" || err "$family healthcheck ping failed"
 }
 
 submit_dns_batch() {
@@ -614,6 +690,19 @@ submit_dns_batch() {
         return 1
     fi
     check_success "$body" "DNS batch update" || return 1
+    if ! jq -e --argjson expected_patches "$expected_patches" --argjson expected_posts "$expected_posts" '
+        (.errors | type == "array") and
+        (.result | type == "object") and
+        ($expected_patches == 0 or (.result.patches | type == "array")) and
+        ($expected_posts == 0 or (.result.posts | type == "array")) and
+        all(.result.patches[]?;
+            type == "object" and (.id | type == "string" and length > 0)) and
+        all(.result.posts[]?;
+            type == "object" and (.id | type == "string" and length > 0))
+    ' <<<"$body" >/dev/null; then
+        err "Cloudflare API returned an invalid DNS batch response"
+        return 1
+    fi
     { read -r error_count; read -r actual_patches; read -r actual_posts; } < <(
         jq -r '[(.errors // [] | length), (.result.patches // [] | length),
                 (.result.posts // [] | length)] | .[]' <<<"$body"
@@ -639,10 +728,10 @@ on_exit() {
     [[ -n "$CF_AUTH_CONFIG" ]] && rm -f -- "$CF_AUTH_CONFIG"
     if (( rc != 0 )); then
         if [[ "$A_STATUS" == attempted && -n "$A_HC" ]]; then
-            "${CURL_GET[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
+            "${CURL_HC[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
         fi
         if [[ "$AAAA_STATUS" == attempted && -n "$AAAA_HC" ]]; then
-            "${CURL_GET[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
+            "${CURL_HC[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
         fi
     fi
     if [[ ${#NOTIFY_LINES[@]} -gt 0 ]] && command -v sendmail >/dev/null; then
@@ -677,7 +766,7 @@ while getopts "qt:s46h" FLAG; do
     esac
 done
 shift $((OPTIND - 1))
-if [[ $# -lt 1 || -z "${1:-}" ]]; then
+if [[ $# -ne 1 || -z "${1:-}" ]]; then
     print_usage
     exit 1
 fi
@@ -696,13 +785,18 @@ fi
 # Explicit source policy: external (the default) or interface:<name>.
 A_SOURCE=${CLOUDFLARE_DDNS_A_SOURCE:-external}
 AAAA_SOURCE=${CLOUDFLARE_DDNS_AAAA_SOURCE:-external}
-case "$A_SOURCE" in external|interface:?*) ;; *) err "Invalid CLOUDFLARE_DDNS_A_SOURCE: $A_SOURCE"; exit 1;; esac
-case "$AAAA_SOURCE" in external|interface:?*) ;; *) err "Invalid CLOUDFLARE_DDNS_AAAA_SOURCE: $AAAA_SOURCE"; exit 1;; esac
+if [[ "$DO_IPV4" = true ]]; then
+    case "$A_SOURCE" in external|interface:?*) ;; *) err "Invalid CLOUDFLARE_DDNS_A_SOURCE: $A_SOURCE"; exit 1;; esac
+fi
+if [[ "$DO_IPV6" = true ]]; then
+    case "$AAAA_SOURCE" in external|interface:?*) ;; *) err "Invalid CLOUDFLARE_DDNS_AAAA_SOURCE: $AAAA_SOURCE"; exit 1;; esac
+fi
 
 # ---- preflight checks ----
 load_systemd_credentials
-require_cmd curl jq flock awk tr
-if [[ "$A_SOURCE" == interface:* || "$AAAA_SOURCE" == interface:* ]]; then
+require_cmd curl jq flock awk tr mktemp chmod rm head
+if { [[ "$DO_IPV4" = true && "$A_SOURCE" == interface:* ]] ||
+     [[ "$DO_IPV6" = true && "$AAAA_SOURCE" == interface:* ]]; }; then
     require_cmd ip
 fi
 
@@ -726,9 +820,7 @@ if [[ ! -d "$STATE_DIR" || ! -w "$STATE_DIR" ]]; then
     exit 1
 fi
 create_curl_auth_config
-# Sanitize record name so unusual input can't escape STATE_DIR
-RECORD_SAFE=${RECORD//[^A-Za-z0-9._-]/_}
-LOCK_FILE="$STATE_DIR/${RECORD_SAFE}.lock"
+LOCK_FILE="$STATE_DIR/${RECORD}.lock"
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
     err "Another instance is already running for $RECORD"
