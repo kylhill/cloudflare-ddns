@@ -33,6 +33,8 @@ USER_AGENT="cloudflare-ddns/2.5"
 
 CF_API="https://api.cloudflare.com/client/v4"
 CF_AUTH_CONFIG=""
+RUN_DIR=""
+HTTPS_ALLOWED_TARGETS=()
 A_SOURCE=""
 AAAA_SOURCE=""
 
@@ -639,6 +641,17 @@ transform_https_hints() {
     printf '%s\n%s\n%s\n%s\n%s\n' "$old4" "$old6" "$ipv4" "$ipv6" "$out"
 }
 
+https_target_allowed() {
+    local target="$1" allowed
+    [[ "$target" == . ]] && return 0
+    target=$(normalize_record "$target")
+    [[ "$target" == "$RECORD" ]] && return 0
+    for allowed in "${HTTPS_ALLOWED_TARGETS[@]}"; do
+        [[ "$target" == "$allowed" ]] && return 0
+    done
+    return 1
+}
+
 plan_https_record() {
     local ipv4="$1" ipv6="$2" response="$3"
     local id value priority target ttl old4 old6 new_value data output message transformed
@@ -646,6 +659,10 @@ plan_https_record() {
     { read -r id; read -r value; read -r priority; read -r target; read -r ttl; } < <(parse_https_record "$response")
     if [[ -n "$id" ]] && (( priority == 0 )); then
         err "HTTPS record for $RECORD uses AliasMode (priority 0); address hints are ignored by clients. Update the referenced service endpoint instead."
+        return 1
+    fi
+    if [[ -n "$id" ]] && ! https_target_allowed "$target"; then
+        err "HTTPS target $target is outside the managed hostname $RECORD; refusing to refresh its address hints. Only allow additional targets known to share this machine's addresses."
         return 1
     fi
     transformed=$(transform_https_hints "$value" "$ipv4" "$ipv6") || return 1
@@ -765,8 +782,10 @@ submit_dns_batch() {
 # doesn't override the script's real exit status under `set -e`.
 on_exit() {
     local rc=$?
+    trap - EXIT
+    trap '' HUP INT TERM
     set +e
-    [[ -n "$CF_AUTH_CONFIG" ]] && rm -f -- "$CF_AUTH_CONFIG"
+    [[ -n "$RUN_DIR" ]] && rm -rf -- "$RUN_DIR"
     if (( rc != 0 )); then
         if [[ "$A_STATUS" == attempted && -n "$A_HC" ]]; then
             ping_hc A "$A_HC" fail
@@ -793,6 +812,9 @@ on_exit() {
     exit "$rc"
 }
 trap on_exit EXIT
+trap 'err "Interrupted by SIGHUP"; exit 129' HUP
+trap 'err "Interrupted by SIGINT"; exit 130' INT
+trap 'err "Interrupted by SIGTERM"; exit 143' TERM
 
 # ---- argument parsing ----
 while getopts "qt:s46h" FLAG; do
@@ -833,6 +855,23 @@ if [[ "$DO_IPV6" = true ]]; then
     case "$AAAA_SOURCE" in external|interface:?*) ;; *) err "Invalid CLOUDFLARE_DDNS_AAAA_SOURCE: $AAAA_SOURCE"; exit 1;; esac
 fi
 
+if [[ "$DO_HTTPS" = true && -n "${CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS:-}" ]]; then
+    allowed_targets="$CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS"
+    if [[ "$allowed_targets" == *$'\n'* || "$allowed_targets" == *$'\r'* || "$allowed_targets" == *, ]]; then
+        err "Invalid CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS: expected comma-separated FQDNs"
+        exit 1
+    fi
+    IFS=, read -r -a configured_targets <<<"$allowed_targets"
+    for allowed_target in "${configured_targets[@]}"; do
+        allowed_target=$(normalize_record "$allowed_target")
+        if ! valid_record "$allowed_target"; then
+            err "Invalid FQDN in CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS"
+            exit 1
+        fi
+        HTTPS_ALLOWED_TARGETS+=("$allowed_target")
+    done
+fi
+
 # ---- preflight checks ----
 case "$CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER" in
     healthchecks|uptime-kuma) ;;
@@ -870,6 +909,10 @@ if ! flock -n "$LOCK_FD"; then
     err "Another instance is already running for $RECORD"
     exit 1
 fi
+# Keep every temporary response and credential in a directory owned by this
+# invocation, including files created by command-substitution subprocesses.
+RUN_DIR=$(mktemp -d "$STATE_DIR/run.XXXXXX")
+STATE_DIR="$RUN_DIR"
 create_curl_auth_config
 
 # ---- fetch and validate current records before planning any mutations ----

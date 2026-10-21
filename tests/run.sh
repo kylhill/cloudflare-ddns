@@ -177,6 +177,10 @@ if [[ "$method" == GET && "$url" == */dns_records ]]; then
         create_a)
             records_response 0 '[]'
             ;;
+        signal_exit)
+            kill -s "$TEST_SIGNAL" "$TEST_SCRIPT_PID"
+            exit 1
+            ;;
         get_failure)
             printf '{"success":false,"errors":[{"code":9109,"message":"bad token fixture"}]}\n'
             exit 22
@@ -264,12 +268,12 @@ if [[ "$method" == GET && "$url" == */dns_records ]]; then
                 records_response 1 "[$(json_https_record H1 '' 3600)]"
             fi
             ;;
-        https_preserve)
+        https_preserve|https_target)
             if [[ "$type" == A ]]; then
                 records_response 1 "[$(json_record A1 8.8.8.1 false 3600)]"
             elif [[ "$type" == HTTPS ]]; then
-                jq -nc --arg value 'alpn="h3,h2" port="8443" ech="abc" ipv4hint=8.8.8.1 ipv6hint=2606:4700:4700::1' \
-                    '{success:true, errors:[], result:[{id:"H1", type:"HTTPS", ttl:3600, data:{priority:2, target:"svc.example.com", value:$value}}], result_info:{count:1, total_count:1, total_pages:1}}'
+                jq -nc --arg target "$TEST_HTTPS_TARGET" --arg value 'alpn="h3,h2" port="8443" ech="abc" ipv4hint=8.8.8.1 ipv6hint=2606:4700:4700::1' \
+                    '{success:true, errors:[], result:[{id:"H1", type:"HTTPS", ttl:3600, data:{priority:2, target:$target, value:$value}}], result_info:{count:1, total_count:1, total_pages:1}}'
             else
                 records_response 0 '[]'
             fi
@@ -450,6 +454,9 @@ run_script() {
     [[ "$scenario" == ipv4_iface || "$scenario" == ipv4_mismatch || "$scenario" == ipv4_ambiguous ]] && ipv4_iface="wan"
     [[ "$scenario" == no_change || "$scenario" == no_change_hc_fail ]] && { a_hc="http://hc.example/a-secret"; aaaa_hc="http://hc.example/aaaa-secret"; }
     PATH="$MOCKBIN:$PATH" \
+    TEST_SIGNAL="${RUN_SIGNAL:-TERM}" \
+    TEST_HTTPS_TARGET="${RUN_HTTPS_TARGET:-svc.example.com}" \
+    CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS="${RUN_HTTPS_ALLOWED_TARGETS:-}" \
     TEST_SCENARIO="$scenario" \
     TEST_CURL_LOG="$CURL_LOG" \
     TEST_IP_LOG="$IP_LOG" \
@@ -462,7 +469,7 @@ run_script() {
     CLOUDFLARE_DDNS_A_SOURCE="${RUN_A_SOURCE:-${ipv4_iface:+interface:$ipv4_iface}}" \
     CLOUDFLARE_DDNS_AAAA_SOURCE="${RUN_AAAA_SOURCE:-${ipv6_iface:+interface:$ipv6_iface}}" \
     RUNTIME_DIRECTORY="$runtime_dir" \
-        "$SCRIPT" "$@" >"$output" 2>&1
+        bash -c 'export TEST_SCRIPT_PID=$BASHPID; exec "$@"' _ "$SCRIPT" "$@" >"$output" 2>&1
 }
 
 run_script_with_systemd_credentials() {
@@ -476,6 +483,9 @@ run_script_with_systemd_credentials() {
     printf '%s' "${RUN_CREDENTIAL_A_HC:-}" >"$credentials_dir/cloudflare_a_healthcheck"
     printf '%s' "${RUN_CREDENTIAL_AAAA_HC:-}" >"$credentials_dir/cloudflare_aaaa_healthcheck"
     PATH="$MOCKBIN:$PATH" \
+    TEST_SIGNAL="${RUN_SIGNAL:-TERM}" \
+    TEST_HTTPS_TARGET="${RUN_HTTPS_TARGET:-svc.example.com}" \
+    CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS="${RUN_HTTPS_ALLOWED_TARGETS:-}" \
     TEST_SCENARIO="$scenario" \
     TEST_CURL_LOG="$CURL_LOG" \
     TEST_IP_LOG="$IP_LOG" \
@@ -489,7 +499,7 @@ run_script_with_systemd_credentials() {
     CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER="${RUN_HC_PROVIDER:-healthchecks}" \
     CREDENTIALS_DIRECTORY="$credentials_dir" \
     RUNTIME_DIRECTORY="$runtime_dir" \
-        "$SCRIPT" "$@" >"$output" 2>&1
+        bash -c 'export TEST_SCRIPT_PID=$BASHPID; exec "$@"' _ "$SCRIPT" "$@" >"$output" 2>&1
 }
 
 expect_success() {
@@ -665,6 +675,7 @@ assert_contains "$TEST_TMP/HTTPS AliasMode prevents every planned mutation.out" 
 assert_not_contains "$CURL_LOG" '/dns_records/batch'
 [[ ! -s "$SENDMAIL_LOG" ]] || fail "AliasMode refusal sent a change notification"
 
+RUN_HTTPS_ALLOWED_TARGETS=svc.example.com
 expect_success "HTTPS update preserves unrelated SvcParams" https_preserve -4 -s example.com
 https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
 [[ "$https_patch" == *'alpn=\"h3,h2\"'* ]] || fail "HTTPS payload did not preserve existing ALPN"
@@ -675,10 +686,37 @@ https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
 [[ "$https_patch" == *'"priority":2'* ]] || fail "HTTPS payload did not preserve priority"
 [[ "$https_patch" == *'"target":"svc.example.com"'* ]] || fail "HTTPS payload did not preserve target"
 
+RUN_HTTPS_ALLOWED_TARGETS=svc6.example.com
 expect_success "IPv6-only HTTPS update preserves IPv4 hint" https_preserve_v6 -6 -s example.com
 https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
 [[ "$https_patch" == *'ipv4hint=\"8.8.8.9\"'* ]] || fail "HTTPS payload did not preserve ipv4hint"
 [[ "$https_patch" == *'ipv6hint=\"2606:4700:4700::42\"'* ]] || fail "HTTPS payload did not refresh ipv6hint"
+
+unset RUN_HTTPS_ALLOWED_TARGETS
+
+expect_failure "unapproved HTTPS target prevents all mutations" https_target -4 -s example.com
+assert_contains "$TEST_TMP/unapproved HTTPS target prevents all mutations.out" 'outside the managed hostname'
+assert_not_contains "$CURL_LOG" '/dns_records/batch'
+[[ ! -s "$SENDMAIL_LOG" ]] || fail "refused HTTPS target sent a change notification"
+
+RUN_HTTPS_TARGET=EXAMPLE.COM.
+expect_success "HTTPS target matching managed hostname is allowed" https_target -4 -s example.com
+assert_contains "$CURL_LOG" '"target":"EXAMPLE.COM."'
+unset RUN_HTTPS_TARGET
+
+RUN_HTTPS_ALLOWED_TARGETS='other.example.com,SVC.EXAMPLE.COM.'
+expect_success "HTTPS allowlist normalizes case and final dot" https_target -4 -s example.com
+assert_contains "$CURL_LOG" '"target":"svc.example.com"'
+RUN_HTTPS_TARGET=svc.example.com.evil.example
+expect_failure "HTTPS allowlist matches whole names" https_target -4 -s example.com
+assert_not_contains "$CURL_LOG" '/dns_records/batch'
+unset RUN_HTTPS_TARGET
+
+RUN_HTTPS_ALLOWED_TARGETS='svc.example.com,'
+expect_failure "malformed HTTPS allowlist fails before requests" https_target -4 -s example.com
+[[ ! -s "$CURL_LOG" ]] || fail "invalid HTTPS allowlist reached curl"
+expect_success "unused HTTPS allowlist is ignored" lowercase -4 example.com
+unset RUN_HTTPS_ALLOWED_TARGETS
 
 expect_success "HTTPS TTL-only patch omits data" https_ttl_only -4 -s example.com
 https_patch=$(grep '/dns_records/batch' "$CURL_LOG")
@@ -802,6 +840,30 @@ assert_contains "$TEST_TMP/multiline monitoring URL is rejected without changing
 assert_not_contains "$CURL_LOG" 'config=-'
 assert_not_contains "$TEST_TMP/multiline monitoring URL is rejected without changing DNS result.out" 'secret'
 unset RUN_A_HC
+
+# Signal the actual updater process while its mocked GET is in flight.
+# The mock returns immediately so no child process is left behind.
+RUN_A_HC=http://hc.example/a-secret
+for RUN_SIGNAL in TERM INT HUP; do
+    reset_logs
+    signal_output="$TEST_TMP/signal-$RUN_SIGNAL.out"
+    if run_script signal_exit "$signal_output" -4 example.com; then
+        fail "$RUN_SIGNAL unexpectedly succeeded"
+    else
+        signal_rc=$?
+    fi
+    case "$RUN_SIGNAL" in TERM) expected_rc=143;; INT) expected_rc=130;; HUP) expected_rc=129;; esac
+    [[ "$signal_rc" == "$expected_rc" ]] || fail "$RUN_SIGNAL returned $signal_rc instead of $expected_rc"
+    assert_contains "$signal_output" "Interrupted by SIG$RUN_SIGNAL"
+    [[ $(grep -c 'url=http://hc.example/a-secret/fail ' "$CURL_LOG") == 1 ]] || fail "$RUN_SIGNAL did not report failure exactly once"
+    assert_not_contains "$CURL_LOG" '/dns_records/batch'
+    [[ ! -s "$SENDMAIL_LOG" ]] || fail "$RUN_SIGNAL sent a change notification"
+    if compgen -G "$TEST_TMP/runtime-signal_exit/run.*" >/dev/null; then
+        fail "$RUN_SIGNAL left temporary credentials or responses behind"
+    fi
+    printf 'ok - SIG%s reports failure and cleans temporary files\n' "$RUN_SIGNAL"
+done
+unset RUN_A_HC RUN_SIGNAL
 
 invalid_credential_output="$TEST_TMP/invalid zone id.out"
 reset_logs

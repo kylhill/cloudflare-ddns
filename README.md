@@ -26,6 +26,7 @@ Options:
 | `A_HC` *(optional)*     | Monitoring ping URL for the A record run      |
 | `AAAA_HC` *(optional)*  | Monitoring ping URL for the AAAA record run   |
 | `CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER` | `healthchecks` (default) or `uptime-kuma` |
+| `CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS` | Optional comma-separated HTTPS targets confirmed to share this machine's addresses |
 
 `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` can be provided as environment
 variables or as systemd credentials named `cloudflare_api_token` and
@@ -71,6 +72,19 @@ support for HTTP/2 or HTTP/3. Existing SvcParams, including an empty value, are
 preserved except for the selected address hints. HTTPS AliasMode records
 (priority 0) are refused before any batch is submitted because clients ignore
 their address hints; manage the referenced service endpoint instead.
+
+HTTPS ServiceMode targets must be `.` or the managed hostname. To permit
+other names hosted at the same addresses, explicitly list them in
+`CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS` (for example,
+`service.example.com,other.example.com`). Names are compared without case or
+a final dot. Unapproved targets stop the entire batch before submission.
+The Ansible role exposes this as the `cloudflare_ddns_https_allowed_targets`
+list, which defaults to empty.
+
+SIGHUP, SIGINT, and SIGTERM exit through cleanup with a nonzero status and
+report failure for attempted families. Temporary credentials and responses
+are removed together. SIGKILL cannot be trapped; systemd removes the runtime
+directory when the service stops.
 
 ## Dependencies
 

@@ -21,6 +21,8 @@ LoadCredential=cloudflare_zone_id:/etc/cloudflare-ddns/zone-id
 Environment="CLOUDFLARE_DDNS_A_SOURCE=external"
 Environment="CLOUDFLARE_DDNS_AAAA_SOURCE=external"
 Environment="CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER=healthchecks"
+# Comma-separated names confirmed to share this machine's addresses:
+# Environment="CLOUDFLARE_DDNS_HTTPS_ALLOWED_TARGETS=service.example.com"
 # Optional files containing monitoring URLs, owned by root with mode 0400:
 # LoadCredential=cloudflare_a_healthcheck:/etc/cloudflare-ddns/a-healthcheck
 # LoadCredential=cloudflare_aaaa_healthcheck:/etc/cloudflare-ddns/aaaa-healthcheck
