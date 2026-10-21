@@ -31,6 +31,12 @@ Options:
 variables or as systemd credentials named `cloudflare_api_token` and
 `cloudflare_zone_id`.
 
+Supply monitoring URLs using credentials named `cloudflare_a_healthcheck` and
+`cloudflare_aaaa_healthcheck`. Environment variables `A_HC` and `AAAA_HC` remain
+supported and take precedence, but credentials keep bearer URLs out of unit
+files and service environments. Monitoring URLs also stay out of curl's
+command line. Percent-encoded query parameters are preserved literally.
+
 For Uptime Kuma push URLs, set `CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER=uptime-kuma`.
 The script sets `status=up` on success and `status=down` on failure, preserving
 other query parameters. For Healthchecks.io, failures use the `/fail` path.
@@ -59,6 +65,12 @@ The batch is transactional in Cloudflare's database, but propagation through
 Cloudflare's distributed DNS network is not atomic. Resolvers can temporarily
 observe a mixture of old and new A, AAAA, and HTTPS data after a successful
 update.
+
+New HTTPS records contain address hints only; the script does not assume
+support for HTTP/2 or HTTP/3. Existing SvcParams, including an empty value, are
+preserved except for the selected address hints. HTTPS AliasMode records
+(priority 0) are refused before any batch is submitted because clients ignore
+their address hints; manage the referenced service endpoint instead.
 
 ## Dependencies
 
@@ -90,6 +102,9 @@ units used by the accompanying infrastructure role. Before installing them:
    adjust the flags, TTL, address sources, and optional healthcheck URLs.
 2. Store the token and zone ID in `/etc/cloudflare-ddns/api-token` and
    `/etc/cloudflare-ddns/zone-id`, owned by root with mode `0400`.
+   For monitoring, store each URL in `/etc/cloudflare-ddns/a-healthcheck` or
+   `/etc/cloudflare-ddns/aaaa-healthcheck` with the same ownership and mode,
+   and enable the corresponding `LoadCredential=` lines in the service.
 3. Install the script at `/usr/local/bin/cloudflare-ddns.sh` and the units under
    `/etc/systemd/system/`, then enable `cloudflare-ddns.timer`.
 

@@ -81,7 +81,13 @@ done
 [[ -n "$output_file" ]] && exec >"$output_file"
 
 config_mode=""
-[[ -n "$config_file" ]] && config_mode=$(stat -c '%a' "$config_file")
+if [[ "$config_file" == - ]]; then
+    IFS= read -r config_line
+    url="${config_line#url = \"}"
+    url="${url%\"}"
+elif [[ -n "$config_file" ]]; then
+    config_mode=$(stat -c '%a' "$config_file")
+fi
 printf 'method=%s family=%s type=%s name_exact=%s url=%s data=%s config=%s mode=%s raw=%s\n' \
     "$method" "$family" "$type" "$name_exact" "$url" "$data" "$config_file" "$config_mode" "$raw" >>"$TEST_CURL_LOG"
 
@@ -126,6 +132,10 @@ if [[ "$url" == *cdn-cgi/trace ]]; then
             -6) printf ':::\n' ;;
             *) exit 7 ;;
         esac
+        exit 0
+    fi
+    if [[ "${TEST_SCENARIO:-}" == ipv6_bad_trailing || "${TEST_SCENARIO:-}" == ipv6_bad_full_trailing ]]; then
+        [[ "$TEST_SCENARIO" == ipv6_bad_trailing ]] && printf 'ip=2606:4700:4700::42:\n' || printf 'ip=2606:4700:4700:0:0:0:0:42:\n'
         exit 0
     fi
     case "$family" in
@@ -234,13 +244,24 @@ if [[ "$method" == GET && "$url" == */dns_records ]]; then
         ipv4_iface|ipv4_mismatch|ipv4_ambiguous)
             records_response 1 "[$(json_record A1 8.8.4.4 false 3600)]"
             ;;
-        invalid_provider_fallback)
+        invalid_provider_fallback|ipv6_bad_trailing|ipv6_bad_full_trailing)
             if [[ "$type" == A ]]; then
                 records_response 1 "[$(json_record A1 8.8.8.43 false 3600)]"
             elif [[ "$type" == AAAA ]]; then
                 records_response 1 "[$(json_record AAAA1 2606:4700:4700::43 false 3600)]"
             else
                 records_response 0 '[]'
+            fi
+            ;;
+        https_empty|https_create|https_alias)
+            if [[ "$type" == A ]]; then
+                records_response 1 "[$(json_record A1 8.8.8.1 false 3600)]"
+            elif [[ "$TEST_SCENARIO" == https_create ]]; then
+                records_response 0 '[]'
+            elif [[ "$TEST_SCENARIO" == https_alias ]]; then
+                jq -nc '{success:true,errors:[],result:[{id:"H1",ttl:3600,data:{priority:0,target:"svc.example.com",value:""}}],result_info:{total_pages:1}}'
+            else
+                records_response 1 "[$(json_https_record H1 '' 3600)]"
             fi
             ;;
         https_preserve)
@@ -452,6 +473,8 @@ run_script_with_systemd_credentials() {
     mkdir -p "$runtime_dir" "$credentials_dir"
     printf 'test-token\n' >"$credentials_dir/cloudflare_api_token"
     printf '0123456789abcdef0123456789abcdef\n' >"$credentials_dir/cloudflare_zone_id"
+    printf '%s' "${RUN_CREDENTIAL_A_HC:-}" >"$credentials_dir/cloudflare_a_healthcheck"
+    printf '%s' "${RUN_CREDENTIAL_AAAA_HC:-}" >"$credentials_dir/cloudflare_aaaa_healthcheck"
     PATH="$MOCKBIN:$PATH" \
     TEST_SCENARIO="$scenario" \
     TEST_CURL_LOG="$CURL_LOG" \
@@ -459,6 +482,11 @@ run_script_with_systemd_credentials() {
     TEST_SENDMAIL_LOG="$SENDMAIL_LOG" \
     CLOUDFLARE_DDNS_A_SOURCE="external" \
     CLOUDFLARE_DDNS_AAAA_SOURCE="external" \
+    CLOUDFLARE_API_TOKEN="" \
+    CLOUDFLARE_ZONE_ID="" \
+    A_HC="${RUN_A_HC:-}" \
+    AAAA_HC="${RUN_AAAA_HC:-}" \
+    CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER="${RUN_HC_PROVIDER:-healthchecks}" \
     CREDENTIALS_DIRECTORY="$credentials_dir" \
     RUNTIME_DIRECTORY="$runtime_dir" \
         "$SCRIPT" "$@" >"$output" 2>&1
@@ -508,6 +536,7 @@ if ! run_script_with_systemd_credentials create_a "$credentials_output" -4 examp
 fi
 assert_contains "$CURL_LOG" "--config"
 assert_not_contains "$CURL_LOG" "Authorization: Bearer test-token"
+assert_not_contains "$CURL_LOG" "config=-"
 printf 'ok - systemd credentials are supported\n'
 
 expect_failure "lock contention creates no auth file" lock_held -4 example.com
@@ -570,6 +599,13 @@ assert_contains "$TEST_TMP/invalid provider output falls back.out" "Current IPv4
 expect_success "invalid IPv6 provider output falls back" invalid_provider_fallback -6 example.com
 assert_contains "$TEST_TMP/invalid IPv6 provider output falls back.out" "Current IPv6 is 2606:4700:4700::43"
 
+expect_success "compressed trailing colon falls back" ipv6_bad_trailing -6 example.com
+assert_contains "$TEST_TMP/compressed trailing colon falls back.out" "Current IPv6 is 2606:4700:4700::43"
+assert_contains "$CURL_LOG" 'url=https://icanhazip.com '
+expect_success "full trailing colon falls back" ipv6_bad_full_trailing -6 example.com
+assert_contains "$TEST_TMP/full trailing colon falls back.out" "Current IPv6 is 2606:4700:4700::43"
+assert_contains "$CURL_LOG" 'url=https://icanhazip.com '
+
 expect_failure "non-public provider addresses are rejected" private_provider -4 example.com
 assert_contains "$TEST_TMP/non-public provider addresses are rejected.out" "Failed to determine external IP"
 [[ $(grep -Ec 'cdn-cgi|icanhazip|ifconfig.co' "$CURL_LOG") -eq 3 ]] || fail "did not try every IP provider"
@@ -618,8 +654,20 @@ expect_success "IPv6 fallback excludes equivalent published form" ipv6_fallback_
 assert_contains "$TEST_TMP/IPv6 fallback excludes equivalent published form.out" "Current IPv6 is 2606:4700:4700::43"
 assert_contains "$CURL_LOG" '"content":"2606:4700:4700::43"'
 
+expect_success "empty HTTPS parameters gain only address hints" https_empty -4 -s example.com
+assert_contains "$CURL_LOG" 'ipv4hint=\"8.8.8.42\"'
+assert_not_contains "$CURL_LOG" 'alpn='
+expect_success "new HTTPS records contain only address hints" https_create -4 -s example.com
+assert_contains "$CURL_LOG" '"posts":[{"type":"HTTPS"'
+assert_not_contains "$CURL_LOG" 'alpn='
+expect_failure "HTTPS AliasMode prevents every planned mutation" https_alias -4 -s example.com
+assert_contains "$TEST_TMP/HTTPS AliasMode prevents every planned mutation.out" 'AliasMode (priority 0)'
+assert_not_contains "$CURL_LOG" '/dns_records/batch'
+[[ ! -s "$SENDMAIL_LOG" ]] || fail "AliasMode refusal sent a change notification"
+
 expect_success "HTTPS update preserves unrelated SvcParams" https_preserve -4 -s example.com
 https_patch=$(grep '/dns_records/batch' "$CURL_LOG" | tail -n 1)
+[[ "$https_patch" == *'alpn=\"h3,h2\"'* ]] || fail "HTTPS payload did not preserve existing ALPN"
 [[ "$https_patch" == *'port=\"8443\"'* ]] || fail "HTTPS payload did not preserve port"
 [[ "$https_patch" == *'ech=\"abc\"'* ]] || fail "HTTPS payload did not preserve ech"
 [[ "$https_patch" == *'ipv4hint=\"8.8.8.42\"'* ]] || fail "HTTPS payload did not refresh ipv4hint"
@@ -718,6 +766,42 @@ RUN_HC_PROVIDER=invalid
 expect_failure "unknown healthcheck provider fails before requests" lowercase -4 example.com
 [[ ! -s "$CURL_LOG" ]] || fail "invalid monitoring provider reached curl"
 unset RUN_A_HC RUN_AAAA_HC RUN_HC_PROVIDER
+
+RUN_CREDENTIAL_A_HC='http://hc.example/a-secret?status=up&msg=DNS%20updated&ping='
+RUN_CREDENTIAL_AAAA_HC='http://hc.example/aaaa-secret?status=up&msg=DNS%20updated&ping='
+RUN_HC_PROVIDER=uptime-kuma
+reset_logs
+credential_hc_output="$TEST_TMP/credential monitoring.out"
+run_script_with_systemd_credentials no_change "$credential_hc_output" -s example.com || fail "credential monitoring failed"
+assert_contains "$CURL_LOG" 'url=http://hc.example/a-secret?msg=DNS%20updated&ping=&status=up '
+assert_contains "$CURL_LOG" 'url=http://hc.example/aaaa-secret?msg=DNS%20updated&ping=&status=up '
+while IFS= read -r curl_line; do
+    [[ "${curl_line#* raw=}" != *secret* ]] || fail "monitoring URL appeared in curl arguments"
+done <"$CURL_LOG"
+printf 'ok - monitoring credentials preserve percent encoding without exposing curl arguments\n'
+
+reset_logs
+if run_script_with_systemd_credentials batch_failure "$credential_hc_output" -s example.com; then
+    fail "credential monitoring batch failure unexpectedly succeeded"
+fi
+assert_contains "$CURL_LOG" 'url=http://hc.example/a-secret?msg=DNS%20updated&ping=&status=down '
+assert_contains "$CURL_LOG" 'url=http://hc.example/aaaa-secret?msg=DNS%20updated&ping=&status=down '
+printf 'ok - credential monitoring reports failures for both families\n'
+
+RUN_A_HC='http://hc.example/override-secret'
+reset_logs
+run_script_with_systemd_credentials lowercase "$credential_hc_output" -4 example.com || fail "monitoring override failed"
+assert_contains "$CURL_LOG" 'url=http://hc.example/override-secret?status=up '
+assert_not_contains "$CURL_LOG" 'msg=DNS%20updated'
+printf 'ok - monitoring environment overrides credentials\n'
+unset RUN_A_HC RUN_CREDENTIAL_A_HC RUN_CREDENTIAL_AAAA_HC RUN_HC_PROVIDER
+
+RUN_A_HC=$'http://hc.example/secret\nurl = "http://injected.example"'
+expect_success "multiline monitoring URL is rejected without changing DNS result" lowercase -4 example.com
+assert_contains "$TEST_TMP/multiline monitoring URL is rejected without changing DNS result.out" 'A healthcheck URL contains a newline'
+assert_not_contains "$CURL_LOG" 'config=-'
+assert_not_contains "$TEST_TMP/multiline monitoring URL is rejected without changing DNS result.out" 'secret'
+unset RUN_A_HC
 
 invalid_credential_output="$TEST_TMP/invalid zone id.out"
 reset_logs

@@ -197,6 +197,9 @@ valid_ipv6() {
     local -a head_parts tail_parts parts
     [[ -n "$ip" && "$ip" == *:* ]] || return 1
     [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    # read -a drops trailing empty fields; reject them before splitting.
+    [[ "$ip" != :* || "$ip" == ::* ]] || return 1
+    [[ "$ip" != *: || "$ip" == *:: ]] || return 1
 
     if [[ "$ip" == *.* ]]; then
         local ipv4_part="${ip##*:}"
@@ -424,6 +427,12 @@ load_systemd_credentials() {
     if [[ -z "$CLOUDFLARE_ZONE_ID" && -r "$CREDENTIALS_DIRECTORY/cloudflare_zone_id" ]]; then
         CLOUDFLARE_ZONE_ID=$(<"$CREDENTIALS_DIRECTORY/cloudflare_zone_id")
     fi
+    if [[ -z "$A_HC" && -r "$CREDENTIALS_DIRECTORY/cloudflare_a_healthcheck" ]]; then
+        A_HC=$(<"$CREDENTIALS_DIRECTORY/cloudflare_a_healthcheck")
+    fi
+    if [[ -z "$AAAA_HC" && -r "$CREDENTIALS_DIRECTORY/cloudflare_aaaa_healthcheck" ]]; then
+        AAAA_HC=$(<"$CREDENTIALS_DIRECTORY/cloudflare_aaaa_healthcheck")
+    fi
 }
 
 create_curl_auth_config() {
@@ -579,7 +588,6 @@ transform_https_hints() {
     local value="${1:-}" ipv4="$2" ipv6="$3" token="" ch key item token_value out=""
     local old4="" old6="" in_quote=0 ipv4_count=0 ipv6_count=0 i
     local -a tokens=()
-    [[ -z "$value" ]] && value='alpn="h3,h2"'
     if [[ "$value" == *\\* ]]; then
         err "HTTPS SvcParams contain escape sequences that cannot be preserved safely; refusing to update"
         return 1
@@ -636,6 +644,10 @@ plan_https_record() {
     local id value priority target ttl old4 old6 new_value data output message transformed
     local ipv4_changed=false ipv6_changed=false hints_changed=false ttl_changed=false
     { read -r id; read -r value; read -r priority; read -r target; read -r ttl; } < <(parse_https_record "$response")
+    if [[ -n "$id" ]] && (( priority == 0 )); then
+        err "HTTPS record for $RECORD uses AliasMode (priority 0); address hints are ignored by clients. Update the referenced service endpoint instead."
+        return 1
+    fi
     transformed=$(transform_https_hints "$value" "$ipv4" "$ipv6") || return 1
     { read -r old4; read -r old6; read -r ipv4; read -r ipv6; read -r new_value; } <<<"$transformed"
     address_value_changed -4 "$old4" "$ipv4" && ipv4_changed=true
@@ -695,9 +707,16 @@ healthcheck_url() {
 ping_hc() {
     local family="$1" url="$2" status="${3:-success}"
     [[ -z "$url" ]] && return 0
-    # Monitoring delivery is best-effort after DNS reconciliation succeeds.
+    # Keep bearer URLs out of curl's command line and diagnostic output.
+    if [[ "$url" == *$'\n'* || "$url" == *$'\r'* ]]; then
+        err "$family healthcheck URL contains a newline"
+        return 0
+    fi
     url=$(healthcheck_url "$url" "$status")
-    "${CURL_HC[@]}" -o /dev/null "$url" 2>/dev/null || err "$family healthcheck ping failed"
+    url=${url//\\/\\\\}
+    url=${url//\"/\\\"}
+    printf 'url = "%s"\n' "$url" |
+        "${CURL_HC[@]}" --config - -o /dev/null 2>/dev/null || err "$family healthcheck ping failed"
 }
 
 submit_dns_batch() {

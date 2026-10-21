@@ -21,8 +21,9 @@ LoadCredential=cloudflare_zone_id:/etc/cloudflare-ddns/zone-id
 Environment="CLOUDFLARE_DDNS_A_SOURCE=external"
 Environment="CLOUDFLARE_DDNS_AAAA_SOURCE=external"
 Environment="CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER=healthchecks"
-# Environment="A_HC=https://hc-ping.com/replace-with-your-ping-key"
-# Environment="AAAA_HC=https://hc-ping.com/replace-with-your-ping-key"
+# Optional files containing monitoring URLs, owned by root with mode 0400:
+# LoadCredential=cloudflare_a_healthcheck:/etc/cloudflare-ddns/a-healthcheck
+# LoadCredential=cloudflare_aaaa_healthcheck:/etc/cloudflare-ddns/aaaa-healthcheck
 
 # Replace host.example.com and adjust flags or TTL for your deployment.
 ExecStart=/usr/local/bin/cloudflare-ddns.sh -q -t 3600 host.example.com
