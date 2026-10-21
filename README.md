@@ -23,12 +23,19 @@ Options:
 | `CLOUDFLARE_ZONE_ID`    | Zone ID containing the record to update       |
 | `CLOUDFLARE_DDNS_A_SOURCE` | IPv4 source: `external` or `interface:<name>` |
 | `CLOUDFLARE_DDNS_AAAA_SOURCE` | IPv6 source: `external` or `interface:<name>` |
-| `A_HC` *(optional)*     | Healthchecks.io URL for the A record run      |
-| `AAAA_HC` *(optional)*  | Healthchecks.io URL for the AAAA record run   |
+| `A_HC` *(optional)*     | Monitoring ping URL for the A record run      |
+| `AAAA_HC` *(optional)*  | Monitoring ping URL for the AAAA record run   |
+| `CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER` | `healthchecks` (default) or `uptime-kuma` |
 
 `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ZONE_ID` can be provided as environment
 variables or as systemd credentials named `cloudflare_api_token` and
 `cloudflare_zone_id`.
+
+For Uptime Kuma push URLs, set `CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER=uptime-kuma`.
+The script sets `status=up` on success and `status=down` on failure, preserving
+other query parameters. For Healthchecks.io, failures use the `/fail` path.
+Monitoring delivery failures are logged without exposing the URL and do not
+change the DNS reconciliation result.
 
 The zone ID must be its 32-character hexadecimal Cloudflare identifier. API
 tokens and credential files must contain a single token value without embedded
@@ -85,3 +92,9 @@ units used by the accompanying infrastructure role. Before installing them:
    `/etc/cloudflare-ddns/zone-id`, owned by root with mode `0400`.
 3. Install the script at `/usr/local/bin/cloudflare-ddns.sh` and the units under
    `/etc/systemd/system/`, then enable `cloudflare-ddns.timer`.
+
+The service waits for `network-online.target` at boot and retries failed runs
+after two minutes, allowing at most three starts within thirty minutes. Each
+run fetches current DNS state before planning changes; the batch POST itself
+is never retried. Once the start limit expires, the regular timer can start
+the service again.

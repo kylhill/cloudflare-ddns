@@ -18,6 +18,7 @@ set -euo pipefail
 : "${CLOUDFLARE_ZONE_ID:=}"
 : "${A_HC:=}"
 : "${AAAA_HC:=}"
+: "${CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER:=healthchecks}"
 
 QUIET=0
 TTL=3600
@@ -336,7 +337,7 @@ select_interface_ipv4() {
     local iface="$1" json
     local -a candidates
     json=$(ip -j -4 addr show dev "$iface") || { err "Failed to read IPv4 addresses from interface $iface"; return 1; }
-    mapfile -t candidates < <(jq -r '.[]?.addr_info[]? | select(.family == "inet" and .scope == "global") | select(((.flags // []) | index("tentative") | not) and ((.flags // []) | index("dadfailed") | not) and ((.flags // []) | index("deprecated") | not)) | .local' <<<"$json")
+    mapfile -t candidates < <(jq -r '.[]?.addr_info[]? | select(.family == "inet" and .scope == "global") | select(.tentative != true and .dadfailed != true and .deprecated != true and .preferred_life_time != 0) | .local' <<<"$json")
     local -a usable=(); local candidate
     for candidate in "${candidates[@]}"; do public_ipv4 "$candidate" && usable+=("$candidate"); done
     if ((${#usable[@]} != 1)); then
@@ -356,7 +357,7 @@ select_interface_ipv6() {
             continue
         fi
         addresses+=("$addr"); lifetimes+=("$lifetime")
-    done < <(jq -r '.[]?.addr_info[]? | select(.family == "inet6" and .scope == "global") | select(((.flags // []) | index("temporary") | not) and ((.flags // []) | index("tentative") | not) and ((.flags // []) | index("dadfailed") | not) and ((.flags // []) | index("deprecated") | not)) | [.local, (.preferred_life_time // 0 | tostring)] | @tsv' <<<"$json")
+    done < <(jq -r '.[]?.addr_info[]? | select(.family == "inet6" and .scope == "global") | select(.temporary != true and .tentative != true and .dadfailed != true and .deprecated != true and .preferred_life_time != 0) | [.local, (.preferred_life_time // 0 | tostring)] | @tsv' <<<"$json")
     ((${#addresses[@]} > 0)) || { err "No stable public global IPv6 address found on interface $iface"; return 1; }
     local i best=-1 best_lft=-1 numeric ties=0
     for i in "${!addresses[@]}"; do
@@ -669,11 +670,34 @@ plan_https_record() {
     fi
 }
 
+healthcheck_url() {
+    local url="${1%%#*}" status="$2" base query parameter rebuilt=""
+    local -a parameters=()
+    base="${url%%\?*}"
+    if [[ "$CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER" == uptime-kuma ]]; then
+        if [[ "$url" == *\?* ]]; then
+            query="${url#*\?}"
+            IFS='&' read -r -a parameters <<<"$query"
+        fi
+        for parameter in "${parameters[@]}"; do
+            [[ -z "$parameter" || "${parameter%%=*}" == status ]] && continue
+            rebuilt+="${rebuilt:+&}$parameter"
+        done
+        [[ "$status" == success ]] && status=up || status=down
+        printf '%s?%sstatus=%s' "$base" "${rebuilt:+$rebuilt&}" "$status"
+    elif [[ "$status" == fail ]]; then
+        printf '%s/fail%s' "${base%/}" "${url#"$base"}"
+    else
+        printf '%s' "$url"
+    fi
+}
+
 ping_hc() {
-    local family="$1" url="$2"
+    local family="$1" url="$2" status="${3:-success}"
     [[ -z "$url" ]] && return 0
     # Monitoring delivery is best-effort after DNS reconciliation succeeds.
-    "${CURL_HC[@]}" -o /dev/null "$url" || err "$family healthcheck ping failed"
+    url=$(healthcheck_url "$url" "$status")
+    "${CURL_HC[@]}" -o /dev/null "$url" 2>/dev/null || err "$family healthcheck ping failed"
 }
 
 submit_dns_batch() {
@@ -726,10 +750,10 @@ on_exit() {
     [[ -n "$CF_AUTH_CONFIG" ]] && rm -f -- "$CF_AUTH_CONFIG"
     if (( rc != 0 )); then
         if [[ "$A_STATUS" == attempted && -n "$A_HC" ]]; then
-            "${CURL_HC[@]}" -o /dev/null "${A_HC%/}/fail" 2>/dev/null || true
+            ping_hc A "$A_HC" fail
         fi
         if [[ "$AAAA_STATUS" == attempted && -n "$AAAA_HC" ]]; then
-            "${CURL_HC[@]}" -o /dev/null "${AAAA_HC%/}/fail" 2>/dev/null || true
+            ping_hc AAAA "$AAAA_HC" fail
         fi
     fi
     if [[ ${#NOTIFY_LINES[@]} -gt 0 ]] && command -v sendmail >/dev/null; then
@@ -791,6 +815,10 @@ if [[ "$DO_IPV6" = true ]]; then
 fi
 
 # ---- preflight checks ----
+case "$CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER" in
+    healthchecks|uptime-kuma) ;;
+    *) err "Invalid CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER (expected healthchecks or uptime-kuma)"; exit 1 ;;
+esac
 load_systemd_credentials
 require_cmd curl jq flock awk tr mktemp rm head
 if { [[ "$DO_IPV4" = true && "$A_SOURCE" == interface:* ]] ||

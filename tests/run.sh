@@ -216,7 +216,7 @@ if [[ "$method" == GET && "$url" == */dns_records ]]; then
         lowercase)
             records_response 1 "[$(json_record A1 8.8.8.42 false 3600)]"
             ;;
-        ipv6_iface)
+        ipv6_iface|ipv6_deprecated_published)
             records_response 1 "[$(json_record AAAA1 2606:4700:4700::42 false 3600)]"
             ;;
         ipv6_equivalent)
@@ -362,16 +362,18 @@ cat >"$MOCKBIN/ip" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$*" >>"$TEST_IP_LOG"
 if [[ "${TEST_SCENARIO:-}" == ipv4_ambiguous ]]; then
-    printf '[{"addr_info":[{"family":"inet","local":"8.8.4.4","scope":"global","flags":[]},{"family":"inet","local":"1.1.1.1","scope":"global","flags":[]}]}]\n'
+    printf '[{"addr_info":[{"family":"inet","local":"8.8.4.4","scope":"global"},{"family":"inet","local":"1.1.1.1","scope":"global"}]}]\n'
 elif [[ "$*" == *" -4 "* || "$1" == "-j" && "$2" == "-4" ]]; then
-    printf '[{"addr_info":[{"family":"inet","local":"8.8.4.4","scope":"global","flags":[]}]}]\n'
+    printf '[{"addr_info":[{"family":"inet","local":"8.8.4.4","scope":"global"},{"family":"inet","local":"1.1.1.1","scope":"global","deprecated":true},{"family":"inet","local":"1.0.0.1","scope":"global","tentative":true},{"family":"inet","local":"8.8.8.8","scope":"global","dadfailed":true},{"family":"inet","local":"9.9.9.9","scope":"global","preferred_life_time":0}]}]\n'
+elif [[ "${TEST_SCENARIO:-}" == ipv6_deprecated_published ]]; then
+    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::42","scope":"global","deprecated":true,"preferred_life_time":0},{"family":"inet6","local":"2606:4700:4700::43","scope":"global","preferred_life_time":1800}]}]\n'
 elif [[ "${TEST_SCENARIO:-}" == ipv6_tie ]]; then
-    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::42","scope":"global","flags":[],"preferred_life_time":1800},{"family":"inet6","local":"2606:4700:4700::43","scope":"global","flags":[],"preferred_life_time":1800}]}]\n'
+    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::42","scope":"global","preferred_life_time":1800},{"family":"inet6","local":"2606:4700:4700::43","scope":"global","preferred_life_time":1800}]}]\n'
 elif [[ "${TEST_SCENARIO:-}" == ipv6_longest || "${TEST_SCENARIO:-}" == ipv6_published ||
         "${TEST_SCENARIO:-}" == ipv6_fallback_equivalent ]]; then
-    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::42","scope":"global","flags":[],"preferred_life_time":1800},{"family":"inet6","local":"2606:4700:4700::43","scope":"global","flags":[],"preferred_life_time":3600}]}]\n'
+    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::42","scope":"global","preferred_life_time":1800},{"family":"inet6","local":"2606:4700:4700::43","scope":"global","preferred_life_time":3600}]}]\n'
 else
-    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::dead","scope":"global","flags":["temporary"],"preferred_life_time":3600},{"family":"inet6","local":"2606:4700:4700::bad","scope":"global","flags":["deprecated"],"preferred_life_time":7200},{"family":"inet6","local":"2606:4700:4700::42","scope":"global","flags":[],"preferred_life_time":1800}]}]\n'
+    printf '[{"addr_info":[{"family":"inet6","local":"2606:4700:4700::dead","scope":"global","temporary":true,"preferred_life_time":3600},{"family":"inet6","local":"2606:4700:4700::bad","scope":"global","deprecated":true,"preferred_life_time":7200},{"family":"inet6","local":"2606:4700:4700::dad","scope":"global","dadfailed":true,"preferred_life_time":7200},{"family":"inet6","local":"2606:4700:4700::dad2","scope":"global","tentative":true,"preferred_life_time":7200},{"family":"inet6","local":"2606:4700:4700::0","scope":"global","preferred_life_time":0},{"family":"inet6","local":"2606:4700:4700::42","scope":"global","preferred_life_time":1800}]}]\n'
 fi
 EOF
 
@@ -418,11 +420,11 @@ run_script() {
     shift 2
     local runtime_dir="$TEST_TMP/runtime-$scenario"
     local ipv6_iface="" ipv4_iface=""
-    local a_hc="" aaaa_hc=""
+    local a_hc="${RUN_A_HC:-}" aaaa_hc="${RUN_AAAA_HC:-}"
     local zone_id="${RUN_ZONE_ID:-0123456789abcdef0123456789abcdef}"
     local api_token="${RUN_API_TOKEN:-test-token}"
     mkdir -p "$runtime_dir"
-    [[ "$scenario" == ipv6_iface || "$scenario" == ipv6_tie || "$scenario" == ipv6_longest ||
+    [[ "$scenario" == ipv6_iface || "$scenario" == ipv6_deprecated_published || "$scenario" == ipv6_tie || "$scenario" == ipv6_longest ||
        "$scenario" == ipv6_published || "$scenario" == ipv6_fallback_equivalent ]] && ipv6_iface="eth0"
     [[ "$scenario" == ipv4_iface || "$scenario" == ipv4_mismatch || "$scenario" == ipv4_ambiguous ]] && ipv4_iface="wan"
     [[ "$scenario" == no_change || "$scenario" == no_change_hc_fail ]] && { a_hc="http://hc.example/a-secret"; aaaa_hc="http://hc.example/aaaa-secret"; }
@@ -433,6 +435,7 @@ run_script() {
     TEST_SENDMAIL_LOG="$SENDMAIL_LOG" \
     CLOUDFLARE_API_TOKEN="$api_token" \
     CLOUDFLARE_ZONE_ID="$zone_id" \
+    CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER="${RUN_HC_PROVIDER:-healthchecks}" \
     A_HC="$a_hc" \
     AAAA_HC="$aaaa_hc" \
     CLOUDFLARE_DDNS_A_SOURCE="${RUN_A_SOURCE:-${ipv4_iface:+interface:$ipv4_iface}}" \
@@ -583,6 +586,10 @@ expect_success "interface IPv6 skips unstable addresses" ipv6_iface -6 example.c
 assert_contains "$TEST_TMP/interface IPv6 skips unstable addresses.out" "Current IPv6 is 2606:4700:4700::42"
 assert_contains "$IP_LOG" "-j -6 addr show dev eth0"
 
+expect_success "published deprecated IPv6 is replaced" ipv6_deprecated_published -6 example.com
+assert_contains "$TEST_TMP/published deprecated IPv6 is replaced.out" "Current IPv6 is 2606:4700:4700::43"
+assert_contains "$CURL_LOG" '"content":"2606:4700:4700::43"'
+
 expect_success "interface IPv4 is selected and source-bound verified" ipv4_iface -4 example.com
 assert_contains "$TEST_TMP/interface IPv4 is selected and source-bound verified.out" "Current IPv4 is 8.8.4.4"
 assert_contains "$CURL_LOG" "--interface host!8.8.4.4"
@@ -681,6 +688,36 @@ assert_contains "$TEST_TMP/batch response without errors array is rejected.out" 
 expect_success "healthcheck delivery failure is nonfatal and redacted" no_change_hc_fail -s example.com
 assert_contains "$TEST_TMP/healthcheck delivery failure is nonfatal and redacted.out" "A healthcheck ping failed"
 assert_not_contains "$TEST_TMP/healthcheck delivery failure is nonfatal and redacted.out" "a-secret"
+
+# Exercise both families and real query-string URLs without external traffic.
+RUN_A_HC='http://hc.example/a-secret?status=up&msg=OK&ping='
+RUN_AAAA_HC='http://hc.example/aaaa-secret?status=up&msg=OK&ping='
+RUN_HC_PROVIDER=uptime-kuma
+expect_failure "Kuma failures send down for both families" batch_failure -s example.com
+assert_contains "$CURL_LOG" 'url=http://hc.example/a-secret?msg=OK&ping=&status=down '
+assert_contains "$CURL_LOG" 'url=http://hc.example/aaaa-secret?msg=OK&ping=&status=down '
+assert_not_contains "$CURL_LOG" 'status=up'
+assert_not_contains "$CURL_LOG" '/fail'
+
+RUN_A_HC='http://hc.example/a-secret?status=down&msg=OK&status=up&ping='
+expect_success "Kuma success replaces existing status parameters" lowercase -4 example.com
+assert_contains "$CURL_LOG" 'url=http://hc.example/a-secret?msg=OK&ping=&status=up '
+assert_not_contains "$CURL_LOG" 'status=down'
+
+RUN_A_HC='http://hc.example/a-secret'
+expect_success "Kuma success supports URLs without a query" lowercase -4 example.com
+assert_contains "$CURL_LOG" 'url=http://hc.example/a-secret?status=up '
+
+RUN_HC_PROVIDER=healthchecks
+RUN_A_HC='http://hc.example/a-secret/?tag=test'
+expect_failure "Healthchecks failure appends path before query" get_failure -4 example.com
+assert_contains "$CURL_LOG" 'url=http://hc.example/a-secret/fail?tag=test '
+assert_not_contains "$CURL_LOG" 'aaaa-secret'
+
+RUN_HC_PROVIDER=invalid
+expect_failure "unknown healthcheck provider fails before requests" lowercase -4 example.com
+[[ ! -s "$CURL_LOG" ]] || fail "invalid monitoring provider reached curl"
+unset RUN_A_HC RUN_AAAA_HC RUN_HC_PROVIDER
 
 invalid_credential_output="$TEST_TMP/invalid zone id.out"
 reset_logs

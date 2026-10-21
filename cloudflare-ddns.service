@@ -2,10 +2,14 @@
 Description=Update Cloudflare Dynamic DNS records
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=30min
+StartLimitBurst=3
 
 [Service]
 Type=oneshot
 TimeoutStartSec=5min
+Restart=on-failure
+RestartSec=2min
 DynamicUser=yes
 UMask=0077
 
@@ -16,6 +20,7 @@ LoadCredential=cloudflare_api_token:/etc/cloudflare-ddns/api-token
 LoadCredential=cloudflare_zone_id:/etc/cloudflare-ddns/zone-id
 Environment="CLOUDFLARE_DDNS_A_SOURCE=external"
 Environment="CLOUDFLARE_DDNS_AAAA_SOURCE=external"
+Environment="CLOUDFLARE_DDNS_HEALTHCHECK_PROVIDER=healthchecks"
 # Environment="A_HC=https://hc-ping.com/replace-with-your-ping-key"
 # Environment="AAAA_HC=https://hc-ping.com/replace-with-your-ping-key"
 
